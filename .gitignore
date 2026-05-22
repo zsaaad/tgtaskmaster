@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+.env
+.env.*
+*.log
+.firebase/
+firebase-debug.log
+firebase-config.js
+.vscode/
+.idea/
+.claude/
+

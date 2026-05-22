@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Toggle Task Master</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="brand-top">TOGGLE</span>
+      <span class="brand-bot">TASK MASTER</span>
+    </div>
+    <label class="who">
+      Playing as
+      <select id="identity"></select>
+    </label>
+    <span id="streak-display" class="zero" title="Daily check-in streak">
+      <span class="flame">🔥</span><span class="streak-num">0</span><span class="streak-label">day</span>
+    </span>
+    <span id="charge-display" class="zero" title="Torch charges (streak insurance)">
+      <span class="shield">🛡</span><span class="charge-num">0</span>
+    </span>
+    <button id="open-ledger">LEDGER</button>
+    <button id="new-task">+ new quest</button>
+  </header>
+
+  <canvas id="play"></canvas>
+  <div id="toast-area"></div>
+
+  <dialog id="task-dialog">
+    <form id="task-form" method="dialog">
+      <h2>NEW QUEST</h2>
+      <label>Title<input name="title" required maxlength="40" autocomplete="off" /></label>
+      <label>Description<textarea name="description" rows="3"></textarea></label>
+      <label>Client
+        <select name="client">
+          <option value="">— none —</option>
+          <option value="Toggle">Toggle</option>
+          <option value="Unitar">Unitar</option>
+          <option value="City U">City U</option>
+        </select>
+      </label>
+      <label>Due date<input name="dueDate" type="date" /></label>
+      <div class="actions">
+        <button type="button" id="cancel-task">cancel</button>
+        <button type="submit">create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="detail-dialog">
+    <div id="detail-content"></div>
+  </dialog>
+
+  <dialog id="ledger-dialog">
+    <div id="ledger-content"></div>
+  </dialog>
+
+  <dialog id="tavern-dialog">
+    <div id="tavern-content"></div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
