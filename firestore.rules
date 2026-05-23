@@ -1,0 +1,28 @@
+rules_version = '2';
+
+// Phase 2 ruleset for Toggle Task Master.
+//
+// Trust model: the team is 4–6 marketing folks. Anonymous auth gives every
+// browser a stable uid. We don't enforce per-member ownership at the rule
+// level — anyone authed can read and write any task. Sufficient for an
+// internal tool. Tighten when we hit a real abuse case.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function authed() {
+      return request.auth != null;
+    }
+
+    match /tasks/{taskId} {
+      allow read, write: if authed();
+    }
+
+    match /team/{docId} {
+      allow read, write: if authed();
+    }
+
+    match /users/{userId} {
+      allow read, write: if authed();
+    }
+  }
+}

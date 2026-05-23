@@ -195,8 +195,7 @@ header {
   to { opacity: 0; transform: translateY(-10px); }
 }
 
-#open-ledger {
-  margin-left: auto;
+#open-ledger, #open-rituals {
   padding: 10px 14px;
   border: 2px solid var(--stone-mid);
   background: var(--header-bg);
@@ -207,13 +206,14 @@ header {
   text-transform: uppercase;
   box-shadow: 3px 3px 0 #000;
 }
-#open-ledger:hover {
+#open-rituals { margin-left: auto; }
+#open-ledger:hover, #open-rituals:hover {
   border-color: var(--torch);
   color: var(--torch);
   transform: translate(-1px, -1px);
   box-shadow: 4px 4px 0 #000;
 }
-#open-ledger:active {
+#open-ledger:active, #open-rituals:active {
   transform: translate(2px, 2px);
   box-shadow: 0 0 0 #000;
 }
@@ -653,6 +653,17 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
   margin-bottom: 14px;
   text-transform: uppercase;
 }
+#detail-content .ritual-badge {
+  display: inline-block;
+  font-size: 8px;
+  padding: 3px 6px;
+  margin-right: 8px;
+  vertical-align: middle;
+  background: #2a0810;
+  color: #ff7060;
+  border: 2px solid #7b0026;
+  letter-spacing: 0.1em;
+}
 #detail-content .desc {
   font-family: "Courier New", monospace;
   font-size: 13px;
@@ -702,3 +713,412 @@ dialog::backdrop { background: rgba(0,0,0,0.7); }
   border-color: #2a1810;
 }
 #detail-content button:hover { transform: translate(-1px, -1px); }
+
+/* === RITUALS === */
+#rituals-dialog {
+  width: 100vw;
+  height: 100vh;
+  max-width: 100vw;
+  max-height: 100vh;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: var(--dungeon-bg);
+  color: var(--parchment);
+  box-shadow: none;
+  overflow: hidden;
+}
+#rituals-dialog::backdrop { background: rgba(0,0,0,0.85); }
+#rituals-content {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+#rituals-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 22px;
+  background: var(--header-bg);
+  border-bottom: 4px solid var(--stone-dark);
+  flex-shrink: 0;
+}
+#rituals-toolbar h2 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--torch);
+  letter-spacing: 0.1em;
+  text-shadow: 2px 2px 0 #000;
+}
+#rituals-toolbar button {
+  font: inherit;
+  font-size: 9px;
+  padding: 8px 12px;
+  border: 2px solid var(--stone-mid);
+  background: var(--header-bg);
+  color: var(--parchment);
+  cursor: pointer;
+  text-transform: uppercase;
+}
+#rituals-toolbar #close-rituals {
+  background: var(--torch);
+  color: #2a1810;
+  border-color: #2a1810;
+}
+#rituals-toolbar #add-ritual {
+  margin-left: auto;
+  background: var(--torch);
+  color: #2a1810;
+  border-color: #2a1810;
+}
+#rituals-toolbar #add-ritual:disabled {
+  background: var(--stone-dark);
+  color: #6a6680;
+  border-color: var(--stone-dark);
+  cursor: not-allowed;
+}
+#rituals-toolbar .ritual-count {
+  font-size: 9px;
+  color: #a09cb8;
+  letter-spacing: 0.08em;
+}
+#rituals-body {
+  flex: 1;
+  overflow: auto;
+  padding: 22px;
+}
+.rituals-blurb {
+  font-family: "Courier New", monospace;
+  font-size: 13px;
+  color: #a09cb8;
+  max-width: 720px;
+  line-height: 1.5;
+  margin: 0 0 22px;
+}
+.ritual-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 880px;
+}
+.ritual-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 18px;
+  padding: 14px 18px;
+  background: var(--header-bg);
+  border: 2px solid var(--stone-dark);
+  box-shadow: 3px 3px 0 #000;
+}
+.ritual-row .ritual-title {
+  font-size: 11px;
+  color: var(--parchment);
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+.ritual-row .ritual-meta {
+  font-size: 8px;
+  color: #a09cb8;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.ritual-row .ritual-status {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 6px 10px;
+  border: 2px solid;
+  white-space: nowrap;
+}
+.ritual-row .ritual-status.neutral  { color: #7ab5e8; border-color: #5b8def; }
+.ritual-row .ritual-status.done     { color: #7ac84a; border-color: #3a7a2a; }
+.ritual-row .ritual-status.blocked  { color: #e87340; border-color: #a03020; }
+.ritual-row .ritual-status.overdue  { color: #ff7060; border-color: #7b0026; background: #2a0810; }
+.ritual-row .ritual-actions {
+  display: flex;
+  gap: 8px;
+}
+.ritual-row button {
+  font: inherit;
+  font-size: 8px;
+  padding: 7px 10px;
+  border: 2px solid var(--stone-mid);
+  background: var(--header-bg);
+  color: var(--parchment);
+  cursor: pointer;
+  text-transform: uppercase;
+}
+.ritual-row button.ritual-delete { color: #e84a3a; }
+.ritual-row button:hover { transform: translate(-1px, -1px); }
+.ritual-empty {
+  font-family: "Courier New", monospace;
+  font-size: 13px;
+  color: #6a6680;
+  padding: 40px 22px;
+  text-align: center;
+  border: 2px dashed var(--stone-dark);
+  max-width: 720px;
+}
+
+#ritual-form {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 380px;
+}
+#ritual-form h2 {
+  margin: 0 0 4px;
+  font-size: 13px;
+  color: var(--torch);
+  letter-spacing: 0.1em;
+  text-shadow: 2px 2px 0 #000;
+}
+#ritual-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 8px;
+  color: #a09cb8;
+  text-transform: uppercase;
+}
+#ritual-form input, #ritual-form textarea, #ritual-form select {
+  font: inherit;
+  font-size: 10px;
+  padding: 8px 10px;
+  border: 2px solid var(--stone-mid);
+  background: #0c0820;
+  color: var(--parchment);
+}
+#ritual-form input:focus, #ritual-form textarea:focus, #ritual-form select:focus {
+  outline: none;
+  border-color: var(--torch);
+}
+#ritual-form textarea {
+  resize: vertical;
+  min-height: 60px;
+  font-family: "Courier New", monospace;
+}
+#ritual-form .actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+#ritual-form button {
+  padding: 8px 12px;
+  border: 2px solid var(--stone-mid);
+  background: var(--header-bg);
+  color: var(--parchment);
+  font: inherit;
+  font-size: 9px;
+  cursor: pointer;
+  text-transform: uppercase;
+}
+#ritual-form button[type="submit"] {
+  background: var(--torch);
+  color: #2a1810;
+  border-color: #2a1810;
+}
+#ritual-form button:hover { transform: translate(-1px, -1px); }
+
+/* === SETTINGS DIALOG === */
+#settings-dialog {
+  max-width: 560px;
+  width: 92vw;
+  max-height: 80vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+#settings-dialog::backdrop { background: rgba(0,0,0,0.78); }
+
+#settings-content {
+  padding: 22px 22px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: hidden;
+  height: 100%;
+}
+#settings-content h2 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--torch);
+  letter-spacing: 0.1em;
+  text-shadow: 2px 2px 0 #000;
+}
+
+.settings-tabs {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+  border-bottom: 2px solid var(--stone-dark);
+  padding-bottom: 0;
+}
+.settings-tabs button {
+  font: inherit;
+  font-size: 9px;
+  padding: 10px 14px;
+  border: 2px solid var(--stone-dark);
+  border-bottom: none;
+  background: transparent;
+  color: #a09cb8;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: -2px;
+}
+.settings-tabs button.active {
+  background: var(--header-bg);
+  border-color: var(--stone-mid);
+  color: var(--torch);
+  text-shadow: 1px 1px 0 #000;
+}
+.settings-tabs button:hover:not(.active) { color: var(--parchment); }
+.settings-tabs .close-x {
+  margin-left: auto;
+  border: 2px solid var(--stone-dark);
+  border-radius: 0;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: #a09cb8;
+}
+.settings-tabs .close-x:hover { color: var(--torch); border-color: var(--torch); }
+
+.settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  padding: 4px 2px;
+  flex: 1;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 2px solid var(--stone-dark);
+  background: #0c0820;
+}
+.settings-row.add-form {
+  border-style: dashed;
+  border-color: var(--stone-mid);
+}
+.settings-row .swatch {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #000;
+  flex-shrink: 0;
+}
+.settings-row input[type="text"] {
+  font: inherit;
+  font-size: 10px;
+  padding: 6px 8px;
+  border: 2px solid transparent;
+  background: transparent;
+  color: var(--parchment);
+  flex: 1;
+  min-width: 0;
+}
+.settings-row input[type="text"]:hover { border-color: var(--stone-mid); }
+.settings-row input[type="text"]:focus {
+  outline: none;
+  border-color: var(--torch);
+  background: #0a0618;
+}
+.settings-row input[type="color"] {
+  width: 36px;
+  height: 28px;
+  border: 2px solid var(--stone-mid);
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.settings-row .member-meta {
+  font-size: 8px;
+  color: #777;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.settings-row .row-delete {
+  font: inherit;
+  font-size: 10px;
+  padding: 4px 10px;
+  border: 2px solid var(--stone-mid);
+  background: transparent;
+  color: #a09cb8;
+  cursor: pointer;
+}
+.settings-row .row-delete:hover:not([disabled]) {
+  color: #ff6b6b;
+  border-color: #ff6b6b;
+}
+.settings-row .row-delete[disabled] {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.settings-row.add-form button {
+  font: inherit;
+  font-size: 9px;
+  padding: 6px 12px;
+  border: 2px solid var(--stone-mid);
+  background: var(--header-bg);
+  color: var(--parchment);
+  cursor: pointer;
+  text-transform: uppercase;
+}
+.settings-row.add-form button:hover { border-color: var(--torch); color: var(--torch); }
+.settings-row.add-form #new-member-save,
+.settings-row.add-form #new-client-save {
+  background: var(--torch);
+  color: #2a1810;
+  border-color: #2a1810;
+}
+
+.add-row {
+  font: inherit;
+  font-size: 9px;
+  padding: 10px 14px;
+  border: 2px dashed var(--stone-mid);
+  background: transparent;
+  color: #a09cb8;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.add-row:hover { border-color: var(--torch); color: var(--torch); }
+
+.settings-hint {
+  margin: 0;
+  font-size: 7px;
+  color: #6b6885;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 1.5;
+}
+.settings-empty {
+  margin: 0;
+  padding: 12px;
+  font-size: 9px;
+  color: #6b6885;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+#open-settings {
+  font: inherit;
+  font-size: 9px;
+  padding: 8px 12px;
+  border: 2px solid var(--stone-mid);
+  background: var(--header-bg);
+  color: var(--parchment);
+  cursor: pointer;
+  text-transform: uppercase;
+}
+#open-settings:hover { border-color: var(--torch); color: var(--torch); }

@@ -3,21 +3,58 @@
 // Data: localStorage. See CLAUDE.md for design constraints.
 
 // --- TEAM ---
-const TEAM = [
+// `let` not const: live mirror of Firestore team/roster. Seed is used on
+// first-ever boot (no remote, no local cache); after that, snapshot listener
+// + localStorage cache are the source of truth.
+const TEAM_SEED = [
   { id: "zaid", name: "Zaid", color: "#5b8def" },
   { id: "yy",   name: "YY",   color: "#e8743b" },
   { id: "vik",  name: "Vik",  color: "#3aa17a" },
   { id: "lina", name: "Lina", color: "#9c6bd8" },
   { id: "sam",  name: "Sam",  color: "#1bb0c2" },
 ];
+let TEAM = loadTeamCached();
 
 // --- CLIENTS ---
-const CLIENTS = ["Toggle", "Unitar", "City U"];
+const CLIENTS_SEED = ["Toggle", "Unitar", "City U"];
+let CLIENTS = loadClientsCached();
 
 // --- CONSTANTS ---
-const STORAGE_TASKS    = "toss.tasks.v2";
-const STORAGE_ME       = "toss.me.v2";
-const STORAGE_STREAKS  = "toss.streaks.v2";
+const STORAGE_TASKS     = "toss.tasks.v2";
+const STORAGE_ME        = "toss.me.v2";
+const STORAGE_STREAKS   = "toss.streaks.v2";
+const STORAGE_TEMPLATES = "toss.templates.v1";
+const STORAGE_TEAM      = "toss.team.v1";
+const STORAGE_CLIENTS   = "toss.clients.v1";
+
+function loadTeamCached() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("toss.team.v1") || "null");
+    if (Array.isArray(raw) && raw.length > 0) return raw;
+  } catch {}
+  return [
+    { id: "zaid", name: "Zaid", color: "#5b8def" },
+    { id: "yy",   name: "YY",   color: "#e8743b" },
+    { id: "vik",  name: "Vik",  color: "#3aa17a" },
+    { id: "lina", name: "Lina", color: "#9c6bd8" },
+    { id: "sam",  name: "Sam",  color: "#1bb0c2" },
+  ];
+}
+function saveTeamCached() { localStorage.setItem(STORAGE_TEAM, JSON.stringify(TEAM)); }
+
+function loadClientsCached() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("toss.clients.v1") || "null");
+    if (Array.isArray(raw)) return raw;
+  } catch {}
+  return ["Toggle", "Unitar", "City U"];
+}
+function saveClientsCached() { localStorage.setItem(STORAGE_CLIENTS, JSON.stringify(CLIENTS)); }
+
+const RECURRING_MAX_PER_USER = 3;
+// 0 = Monday … 6 = Sunday (ISO week ordering)
+const DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DAY_NAMES_LONG = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
 const SCALE = 3;                  // 1 sprite-pixel = SCALE screen px (characters, wall)
 const BASKET_SCALE = 4;           // baskets render larger so they read as prominent containers
@@ -31,10 +68,36 @@ const ORB_R = 22;                 // task orb radius
 const STACK_OFFSET = 7;           // per-stack-item visual offset (px)
 const DRAG_THRESHOLD = 8;
 
+// --- FIREBASE HANDLE ---
+// Populated by initFirebase() if firebase-config.js loaded with real values.
+// All persistence sites check `fb.db` truthiness before writing remotely.
+const fb = {
+  app: null,
+  auth: null,
+  db: null,
+  uid: null,                // Firebase Anonymous UID. Distinct from state.me (the
+                            // team-member id). Phase 3 will link the two.
+  unsubTasks: null,
+  unsubRoster: null,
+  unsubClients: null,
+  hydrated: false,          // true once first task snapshot has arrived
+  writeFailures: 0,         // running count of recent .catch hits — throttles toast
+  lastFailureToastAt: 0,
+  // Local-write timestamps. We just made the change in-memory; the snapshot
+  // echo will deliver the same data within ~300ms. Within ECHO_WINDOW_MS,
+  // skip the dialog re-render so the cursor doesn't get yanked out of a
+  // field the user is typing in. Data still updates; only the visible re-
+  // render is suppressed.
+  lastLocalRosterWriteAt: 0,
+  lastLocalClientsWriteAt: 0,
+};
+const ECHO_WINDOW_MS = 600;
+
 // --- STATE ---
 const state = {
   me: localStorage.getItem(STORAGE_ME) || TEAM[0].id,
   tasks: loadTasks(),
+  templates: loadTemplates(),     // recurring weekly task templates (see CLAUDE.md)
   streaks: loadStreaks(),         // userId -> { lastDay: "YYYY-MM-DD", count: number }
   drag: null,                     // { taskId, offX, offY, startX, startY, moved, path: [{x,y,t}] }
   hoverTarget: null,              // { kind, id } highlighted as drop target while dragging
@@ -55,6 +118,31 @@ function loadTasks() {
       history: t.history || [],
     }));
   } catch { return []; }
+}
+
+function loadTemplates() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORAGE_TEMPLATES) || "[]");
+    return raw.map(tpl => ({ deletedAt: null, ...tpl }));
+  } catch { return []; }
+}
+function saveTemplates() { localStorage.setItem(STORAGE_TEMPLATES, JSON.stringify(state.templates)); }
+
+// ISO week key — Monday-anchored, computed in UTC so it doesn't flip a day
+// early for users near midnight. Returns "YYYY-Www" (e.g. "2026-W21").
+function isoWeekKey(d = new Date()) {
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  // Shift to nearest Thursday — ISO week year pivots on Thursday.
+  t.setUTCDate(t.getUTCDate() + 4 - (t.getUTCDay() || 7));
+  const jan4 = new Date(Date.UTC(t.getUTCFullYear(), 0, 4));
+  const wk = 1 + Math.round((t - jan4) / 604800000);
+  return `${t.getUTCFullYear()}-W${String(wk).padStart(2, "0")}`;
+}
+
+// Monday-anchored day-of-week, 0..6 (Mon=0). Matches DAY_NAMES indexing.
+function isoDow(d = new Date()) {
+  const js = d.getDay();   // 0=Sun..6=Sat
+  return (js + 6) % 7;     // 0=Mon..6=Sun
 }
 
 function loadStreaks() {
@@ -136,7 +224,7 @@ function recordCheckin(userId) {
   if (!s) {
     s = { lastDay: today, count: 1, best: 1, charges: 0, chargesEarned: [] };
     state.streaks[userId] = s;
-    saveStreaks();
+    persist.streak(userId);
     return { prev: 0, next: 1, bumped: true, earnedMilestones: [] };
   }
   const diff = daysBetween(s.lastDay, today);
@@ -147,7 +235,7 @@ function recordCheckin(userId) {
     s.lastDay = today;
     if (s.count > s.best) s.best = s.count;
     const earnedMilestones = maybeEarnCharges(s);
-    saveStreaks();
+    persist.streak(userId);
     return { prev, next: s.count, bumped: true, earnedMilestones };
   }
   // Exactly one missed day, with a charge available — bridge it
@@ -158,14 +246,14 @@ function recordCheckin(userId) {
     s.lastDay = today;
     if (s.count > s.best) s.best = s.count;
     const earnedMilestones = maybeEarnCharges(s);
-    saveStreaks();
+    persist.streak(userId);
     return { prev, next: s.count, bumped: true, chargeUsed: true, earnedMilestones };
   }
   // Break
   const wasCount = s.count;
   s.count = 1;
   s.lastDay = today;
-  saveStreaks();
+  persist.streak(userId);
   return { prev: wasCount, next: 1, broken: true, bumped: true, earnedMilestones: [] };
 }
 
@@ -231,10 +319,119 @@ function announceCheckin(prevCount, result) {
   }
 }
 
+// Snapshot localStorage backup of the full task list. Also called by the
+// Firestore layer after every successful remote write to keep an offline
+// shadow copy.
 function save() {
   localStorage.setItem(STORAGE_TASKS, JSON.stringify(state.tasks));
   localStorage.setItem(STORAGE_ME, state.me);
 }
+
+// === PERSIST ===
+// Typed mutation API. Each call updates local state, snapshots to
+// localStorage, and (if Firebase is connected) writes to Firestore. Mutation
+// sites should call these instead of touching state.tasks + save() directly.
+//
+// Fields that don't survive a round-trip through Firestore (the physics
+// triple x/y/vx/vy) are stripped out of remote writes — they're local-only.
+const PHYSICS_KEYS = ["x", "y", "vx", "vy"];
+function stripPhysics(obj) {
+  const out = {};
+  for (const k in obj) if (!PHYSICS_KEYS.includes(k)) out[k] = obj[k];
+  return out;
+}
+
+// Surfaces a single toast when remote writes start failing — debounced to one
+// per 30s so a network drop doesn't spam the screen. The SDK retries internally
+// (and IndexedDB persistence queues offline writes), so this is observability,
+// not error recovery.
+function noteWriteFailure(err) {
+  console.warn("[ttm] firestore write failed:", err);
+  fb.writeFailures++;
+  const now = Date.now();
+  if (now - fb.lastFailureToastAt > 30000) {
+    fb.lastFailureToastAt = now;
+    showToast(`<em>[OFFLINE]</em> SYNC ISSUE<span class="small">changes saved locally · will retry</span>`, "broken", 4000);
+  }
+}
+
+const persist = {
+  taskCreate(task) {
+    save();
+    if (fb.db) {
+      fb.db.collection("tasks").doc(task.id).set(stripPhysics(task))
+        .catch(noteWriteFailure);
+    }
+  },
+  // `fields` is the merge payload. If `fields.history` is a single new entry
+  // (passed as `{ historyAppend: entry }`), it gets translated to
+  // arrayUnion — so two concurrent take-back races don't drop entries on the
+  // floor. Use `historyAppend` for any append; reserve `history` for a full
+  // overwrite (rarely needed).
+  taskUpdate(taskId, fields) {
+    save();
+    if (!fb.db) return;
+    const { historyAppend, ...rest } = fields;
+    const remote = stripPhysics(rest);
+    if (historyAppend) {
+      remote.history = firebase.firestore.FieldValue.arrayUnion(historyAppend);
+    }
+    if (Object.keys(remote).length === 0) return;
+    fb.db.collection("tasks").doc(taskId).set(remote, { merge: true })
+      .catch(noteWriteFailure);
+  },
+  taskDelete(taskId) {
+    save();
+    if (fb.db) {
+      fb.db.collection("tasks").doc(taskId).delete()
+        .catch(noteWriteFailure);
+    }
+  },
+  streak(userId) {
+    saveStreaks();
+    if (fb.db && state.streaks[userId]) {
+      fb.db.collection("users").doc(userId).set({ streak: state.streaks[userId] }, { merge: true })
+        .catch(noteWriteFailure);
+    }
+  },
+  templateCreate(tpl) {
+    saveTemplates();
+    if (fb.db) {
+      fb.db.collection("recurringTemplates").doc(tpl.id).set(tpl)
+        .catch(noteWriteFailure);
+    }
+  },
+  templateUpdate(tplId, fields) {
+    saveTemplates();
+    if (fb.db) {
+      fb.db.collection("recurringTemplates").doc(tplId).set(fields, { merge: true })
+        .catch(noteWriteFailure);
+    }
+  },
+  rosterUpdate(members) {
+    TEAM = members;
+    saveTeamCached();
+    fb.lastLocalRosterWriteAt = Date.now();
+    onTeamChanged();
+    if (fb.db) {
+      // KNOWN LIMITATION: last-write-wins on concurrent edits. Acceptable for
+      // a 5-person team that rarely opens settings; if abuse appears, switch
+      // to a transaction.
+      fb.db.collection("team").doc("roster").set({ members })
+        .catch(noteWriteFailure);
+    }
+  },
+  clientsUpdate(list) {
+    CLIENTS = list;
+    saveClientsCached();
+    fb.lastLocalClientsWriteAt = Date.now();
+    onClientsChanged();
+    if (fb.db) {
+      fb.db.collection("team").doc("clients").set({ list })
+        .catch(noteWriteFailure);
+    }
+  },
+};
 
 const memberById = id => TEAM.find(m => m.id === id);
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -245,6 +442,93 @@ function isOverdue(t) { return t.dueDate && new Date(t.dueDate) < startOfToday()
 function isDueToday(t) {
   if (!t.dueDate) return false;
   return new Date(t.dueDate).toDateString() === startOfToday().toDateString();
+}
+
+// --- RECURRING ---
+function isRecurring(t) { return !!t.recurringTemplateId; }
+
+// Days since the task's dueDay within its weekKey. Negative = not yet due.
+// 0 = due today, +N = N days overdue.
+function daysSinceDue(t) {
+  if (!isRecurring(t) || t.dueDay == null || !t.weekKey) return -Infinity;
+  // weekKey = "YYYY-Www" — Monday of that ISO week, in UTC.
+  const m = /^(\d{4})-W(\d{2})$/.exec(t.weekKey);
+  if (!m) return -Infinity;
+  const year = +m[1], week = +m[2];
+  // Jan 4 is always in ISO week 1. Find that week's Monday, then add (week-1)*7.
+  const jan4 = new Date(Date.UTC(year, 0, 4));
+  const jan4Dow = jan4.getUTCDay() || 7;   // 1=Mon..7=Sun
+  const week1Monday = new Date(Date.UTC(year, 0, 4 - (jan4Dow - 1)));
+  const dueUtc = new Date(week1Monday.getTime() + ((week - 1) * 7 + t.dueDay) * 86400000);
+  const dueLocal = new Date(dueUtc.getUTCFullYear(), dueUtc.getUTCMonth(), dueUtc.getUTCDate());
+  const today = startOfToday();
+  return Math.round((today - dueLocal) / 86400000);
+}
+
+// Status text + color for a recurring task — shown on canvas and in popup.
+function dueLabelText(t) {
+  if (!isRecurring(t)) return "";
+  const d = daysSinceDue(t);
+  const dayName = DAY_NAMES[t.dueDay].toUpperCase();
+  if (t.status === "done")    return "DONE THIS WEEK";
+  if (t.status === "blocked") return "BLOCKED";
+  if (d < 0)  return `DUE ${dayName} · IN ${-d}D`;
+  if (d === 0) return `DUE TODAY (${dayName})`;
+  if (d === 1) return `1 DAY LATE`;
+  return `${d} DAYS LATE`;
+}
+function dueLabelColor(stage) {
+  return ["#c8c2dc", "#ffd070", "#ff8a60", "#ff5048", "#ff3030"][stage];
+}
+
+// 0 = before due day · 1 = due today · 2 = +1d · 3 = +3d · 4 = +5d or more
+function scaryStage(t) {
+  if (!isRecurring(t)) return 0;
+  const d = daysSinceDue(t);
+  if (d < 0)  return 0;
+  if (d < 1)  return 1;
+  if (d < 3)  return 2;
+  if (d < 5)  return 3;
+  return 4;
+}
+
+function myActiveTemplates() {
+  return state.templates.filter(tpl => tpl.ownerId === state.me && !tpl.deletedAt);
+}
+
+// Idempotent: for each of my active templates, ensure exactly one active
+// instance exists for the current ISO week. Called on app init, identity
+// switch, and right after a template is created.
+function spawnRecurringForMe() {
+  const wk = isoWeekKey();
+  for (const tpl of myActiveTemplates()) {
+    const exists = state.tasks.find(t =>
+      t.recurringTemplateId === tpl.id && t.weekKey === wk
+    );
+    if (exists) continue;
+    const now = Date.now();
+    const task = {
+      id: uid(),
+      title: tpl.title,
+      description: tpl.description || "",
+      client: tpl.client || null,
+      dueDate: null,                    // recurring tasks use dueDay-of-week, not a calendar date
+      status: "active",
+      ownerId: tpl.ownerId,
+      createdBy: tpl.ownerId,
+      history: [],
+      x: null, y: null, vx: 0, vy: 0,
+      recurringTemplateId: tpl.id,
+      weekKey: wk,
+      startDay: tpl.startDay,
+      dueDay: tpl.dueDay,
+      createdAt: now,
+      updatedAt: now,
+    };
+    assignSpawn(task);
+    state.tasks.push(task);
+    persist.taskCreate(task);
+  }
 }
 
 function escapeHtml(s) {
@@ -394,6 +678,8 @@ function resize() {
     }
   }
   rebuildBgCache(w, h, dpr);
+  // Resize only nudges local physics positions — no need to push that to
+  // Firestore. Just keep the offline shadow up to date.
   save();
 }
 
@@ -765,6 +1051,385 @@ function wrapText(text, maxLen) {
   return lines;
 }
 
+// === RECURRING — BONE / SKELETON / MONSTER PROGRESSION ===
+// Stage 0: one bone (small, casual, owner-color ribbon).
+// Stage 1: one bone, amber due-today glow + faster pulse.
+// Stage 2: a pile of crossed bones — work accumulating.
+// Stage 3: sitting skeleton (skull + spine + arms hanging).
+// Stage 4: skeletal monster (glowing eyes, fanged jaw, raised claws, smoke, halo).
+// Stays bone-cream through stage 3; red-eye/halo enter only at stage 4 so the
+// "monster is here" moment lands as a single hard signal.
+
+const BONE_COLOR    = "#e8dec0";
+const BONE_SHADE    = "#9a8c6a";
+const BONE_OUTLINE  = "#0d0a1a";
+
+// Draws a horizontal bone at the current transform origin. Caller does
+// translate + rotate. Optional owner-color ribbon tied around the shaft.
+function drawBoneAtOrigin(s, ownerColor, opts = {}) {
+  const w = 22 * s;
+  const h = 8 * s;
+  const headR = h * 0.6;
+  const shaftH = h * 0.7;
+  const ow = Math.max(1.5, s * 1.8);
+
+  // shadow blob
+  if (!opts.skipShadow) {
+    ctx.fillStyle = "rgba(0,0,0,0.32)";
+    ctx.beginPath();
+    ctx.ellipse(0, h * 0.85, w * 0.42, h * 0.2, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // outline (single unioned region: two big circles + a fat rect)
+  ctx.fillStyle = BONE_OUTLINE;
+  ctx.beginPath();
+  ctx.arc(-w/2 + headR, 0, headR + ow, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(w/2 - headR, 0, headR + ow, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillRect(-w/2 + headR, -shaftH/2 - ow, w - 2 * headR, shaftH + 2 * ow);
+
+  // bone fill
+  ctx.fillStyle = BONE_COLOR;
+  ctx.beginPath();
+  ctx.arc(-w/2 + headR, 0, headR, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(w/2 - headR, 0, headR, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillRect(-w/2 + headR, -shaftH/2, w - 2 * headR, shaftH);
+
+  // lower shading (warm tan)
+  ctx.fillStyle = BONE_SHADE;
+  ctx.globalAlpha = 0.32;
+  ctx.beginPath();
+  ctx.arc(-w/2 + headR, 0, headR, 0, Math.PI);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(w/2 - headR, 0, headR, 0, Math.PI);
+  ctx.fill();
+  ctx.fillRect(-w/2 + headR, 0, w - 2 * headR, shaftH/2);
+  ctx.globalAlpha = 1;
+
+  // owner-color ribbon — tied around the shaft, vertical stripe
+  if (ownerColor && !opts.skipBand) {
+    ctx.fillStyle = ownerColor;
+    ctx.fillRect(-1.6 * s, -shaftH/2 - 1, 3.2 * s, shaftH + 2);
+    ctx.fillStyle = shade(ownerColor, -40);
+    ctx.fillRect(-1.6 * s, shaftH/2 - 0.5, 3.2 * s, 1);
+  }
+
+  // top-left highlight on left head
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  ctx.beginPath();
+  ctx.arc(-w/2 + headR - 1, -1.5, headR * 0.32, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Pixel-style skull at current origin. `monster=true` enlarges + opens jaw.
+function drawSkullAtOrigin(s, monster, pulse) {
+  const w = (monster ? 15 : 11) * s;
+  const h = (monster ? 14 : 10) * s;
+  const ow = Math.max(1.5, s * 1.8);
+
+  // outline
+  ctx.fillStyle = BONE_OUTLINE;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, w/2 + ow, h/2 + ow, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // fill
+  ctx.fillStyle = BONE_COLOR;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, w/2, h/2, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // lower jaw shading
+  ctx.fillStyle = BONE_SHADE;
+  ctx.globalAlpha = 0.28;
+  ctx.beginPath();
+  ctx.ellipse(0, h * 0.15, w/2 * 0.92, h/2 * 0.85, 0, 0, Math.PI);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // eye sockets
+  const eyeR = w * (monster ? 0.18 : 0.14);
+  const eyeY = -h * 0.06;
+  const eyeOffX = w * 0.24;
+
+  if (monster) {
+    // dark socket + glowing red eye
+    ctx.fillStyle = "#000";
+    ctx.beginPath(); ctx.arc(-eyeOffX, eyeY, eyeR + 1.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc( eyeOffX, eyeY, eyeR + 1.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ff4848";
+    ctx.globalAlpha = 0.55 + pulse * 0.45;
+    ctx.beginPath(); ctx.arc(-eyeOffX, eyeY, eyeR, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc( eyeOffX, eyeY, eyeR, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  } else {
+    ctx.fillStyle = "#0d0a1a";
+    ctx.beginPath(); ctx.arc(-eyeOffX, eyeY, eyeR, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc( eyeOffX, eyeY, eyeR, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // nose triangle
+  ctx.fillStyle = "#0d0a1a";
+  ctx.beginPath();
+  ctx.moveTo(0, h * 0.08);
+  ctx.lineTo(-w * 0.06, h * 0.22);
+  ctx.lineTo( w * 0.06, h * 0.22);
+  ctx.closePath();
+  ctx.fill();
+
+  // jaw / teeth
+  if (monster) {
+    // open mouth — dark gap with fangs
+    ctx.fillStyle = "#0d0a1a";
+    ctx.fillRect(-w * 0.33, h * 0.28, w * 0.66, h * 0.22);
+    // fangs — 4 alternating top/bottom triangles
+    ctx.fillStyle = BONE_COLOR;
+    const fangN = 4;
+    const fangW = (w * 0.62) / fangN;
+    for (let i = 0; i < fangN; i++) {
+      const fx = -w * 0.31 + i * fangW + fangW / 2;
+      const topFang = i % 2 === 0;
+      if (topFang) {
+        ctx.beginPath();
+        ctx.moveTo(fx - fangW * 0.35, h * 0.28);
+        ctx.lineTo(fx + fangW * 0.35, h * 0.28);
+        ctx.lineTo(fx, h * 0.46);
+        ctx.closePath();
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(fx - fangW * 0.35, h * 0.50);
+        ctx.lineTo(fx + fangW * 0.35, h * 0.50);
+        ctx.lineTo(fx, h * 0.30);
+        ctx.closePath();
+      }
+      ctx.fill();
+    }
+  } else {
+    // closed mouth — horizontal teeth strip
+    ctx.fillStyle = "#0d0a1a";
+    ctx.fillRect(-w * 0.27, h * 0.30, w * 0.54, h * 0.09);
+    ctx.fillStyle = BONE_COLOR;
+    for (let i = 0; i < 4; i++) {
+      ctx.fillRect(-w * 0.24 + i * w * 0.12, h * 0.31, w * 0.05, h * 0.07);
+    }
+  }
+}
+
+// Draws a clawed forearm + 3-finger hand at current origin, pointing +x.
+function drawClawAtOrigin(s) {
+  drawBoneAtOrigin(s * 0.55, null, { skipBand: true, skipShadow: true });
+  ctx.save();
+  ctx.translate(11 * s * 0.55, 0);
+  ctx.fillStyle = BONE_OUTLINE;
+  for (let i = -1; i <= 1; i++) {
+    ctx.beginPath();
+    ctx.moveTo(0, i * 2 * s);
+    ctx.lineTo(6 * s, i * 3.4 * s);
+    ctx.lineTo(1 * s, i * 2 * s + 1.6 * s);
+    ctx.closePath();
+    ctx.fillStyle = BONE_COLOR;
+    ctx.fill();
+    ctx.strokeStyle = BONE_OUTLINE;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawRecurringTask(x, y, task, scale = 1, options = {}) {
+  const stage = options.stageOverride != null ? options.stageOverride : scaryStage(task);
+  const ownerColor = memberById(task.ownerId)?.color || "#888";
+
+  const pulseSpeed = [400, 220, 160, 130, 90][stage];
+  let pulse = 0.7 + Math.sin(state.t / pulseSpeed + (task.x || 0) * 0.013) * 0.2;
+  if (stage === 2) pulse += (Math.random() - 0.5) * 0.12;
+  pulse = clamp(pulse, 0.5, 1);
+
+  const bob = Math.sin(state.t / 380 + (task.x || 0) * 0.01) * 1.5 * scale;
+
+  // Stage 4 — drifting smoke aura behind everything
+  if (stage === 4) {
+    for (let i = 0; i < 4; i++) {
+      const phase = state.t / 600 + i * 1.4 + (task.x || 0) * 0.01;
+      const sx = x + Math.sin(phase) * 13 * scale;
+      const sy = y - 16 * scale - ((state.t / 32 + i * 48) % 64) * 0.42;
+      const sr = scale * (8 + i * 1.6);
+      ctx.fillStyle = `rgba(40,12,28,${0.20 - i * 0.04})`;
+      ctx.beginPath();
+      ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Stage 4 — pulsing red halo
+  if (stage === 4) {
+    const haloR = 24 * scale + Math.sin(state.t / 90) * 2;
+    ctx.strokeStyle = `rgba(255,40,40,${0.20 + pulse * 0.22})`;
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    ctx.arc(x, y + bob, haloR, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Stage 1 — amber due-today aura
+  if (stage === 1) {
+    ctx.fillStyle = "#e8b840";
+    ctx.globalAlpha = 0.20 * pulse;
+    ctx.beginPath();
+    ctx.ellipse(x, y + bob, 17 * scale, 9 * scale, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  if (stage <= 1) {
+    // One bone — gentle tilt + idle bob
+    const angle = -0.12 + Math.sin(state.t / 720 + (task.x || 0) * 0.01) * 0.08;
+    ctx.save();
+    ctx.translate(x, y + bob);
+    ctx.rotate(angle);
+    drawBoneAtOrigin(scale, ownerColor);
+    ctx.restore();
+  } else if (stage === 2) {
+    // Pile of 3 bones — overlapping at different rotations
+    ctx.save();
+    ctx.translate(x, y + bob + 4 * scale);
+    ctx.rotate(-0.35);
+    drawBoneAtOrigin(scale * 0.95, ownerColor);
+    ctx.restore();
+    ctx.save();
+    ctx.translate(x + 2 * scale, y + bob - 1 * scale);
+    ctx.rotate(0.5);
+    drawBoneAtOrigin(scale * 0.9, ownerColor, { skipBand: true });
+    ctx.restore();
+    ctx.save();
+    ctx.translate(x - 1 * scale, y + bob - 6 * scale);
+    ctx.rotate(-0.08);
+    drawBoneAtOrigin(scale * 0.82, ownerColor, { skipBand: true });
+    ctx.restore();
+  } else if (stage === 3) {
+    // Sitting skeleton — skull + small spine + arms hanging
+    const headY = y + bob - 10 * scale;
+    // Spine — 3 vertebrae below skull
+    for (let i = 0; i < 3; i++) {
+      const vy = headY + (7 + i * 4) * scale;
+      ctx.fillStyle = BONE_OUTLINE;
+      ctx.fillRect(x - 3.5 * scale, vy, 7 * scale, 3 * scale);
+      ctx.fillStyle = BONE_COLOR;
+      ctx.fillRect(x - 2.8 * scale, vy + 0.6, 5.6 * scale, 1.8 * scale);
+    }
+    // Owner-color belt at hip
+    ctx.fillStyle = ownerColor;
+    ctx.fillRect(x - 4 * scale, headY + 19 * scale, 8 * scale, 2 * scale);
+    ctx.fillStyle = shade(ownerColor, -40);
+    ctx.fillRect(x - 4 * scale, headY + 20.5 * scale, 8 * scale, 0.6 * scale);
+    // Arms hanging at sides — short bones angled down
+    ctx.save();
+    ctx.translate(x - 4 * scale, headY + 9 * scale);
+    ctx.rotate(-Math.PI / 2 - 0.25);
+    drawBoneAtOrigin(scale * 0.55, null, { skipBand: true, skipShadow: true });
+    ctx.restore();
+    ctx.save();
+    ctx.translate(x + 4 * scale, headY + 9 * scale);
+    ctx.rotate(Math.PI / 2 + 0.25);
+    drawBoneAtOrigin(scale * 0.55, null, { skipBand: true, skipShadow: true });
+    ctx.restore();
+    // Skull last (on top of spine)
+    ctx.save();
+    ctx.translate(x, headY);
+    drawSkullAtOrigin(scale, false, pulse);
+    ctx.restore();
+  } else {
+    // Stage 4 — monster: raised claws + spine + open-jaw skull
+    const headY = y + bob - 14 * scale;
+    // Spine
+    ctx.fillStyle = BONE_OUTLINE;
+    ctx.fillRect(x - 2 * scale, headY + 11 * scale, 4 * scale, 14 * scale);
+    ctx.fillStyle = BONE_COLOR;
+    ctx.fillRect(x - 1.3 * scale, headY + 11 * scale, 2.6 * scale, 14 * scale);
+    // Hip belt — owner color
+    ctx.fillStyle = ownerColor;
+    ctx.fillRect(x - 5 * scale, headY + 24 * scale, 10 * scale, 2.5 * scale);
+    // Raised arms with claws — both pointing up-and-out
+    const armWiggle = Math.sin(state.t / 260) * 0.1;
+    // left arm
+    ctx.save();
+    ctx.translate(x - 3 * scale, headY + 12 * scale);
+    ctx.rotate(-Math.PI * 0.6 - armWiggle);
+    drawBoneAtOrigin(scale * 0.7, null, { skipBand: true, skipShadow: true });
+    ctx.translate(12 * scale * 0.7, 0);
+    ctx.rotate(-0.45);
+    drawClawAtOrigin(scale);
+    ctx.restore();
+    // right arm
+    ctx.save();
+    ctx.translate(x + 3 * scale, headY + 12 * scale);
+    ctx.rotate(Math.PI * 0.6 + armWiggle);
+    ctx.scale(-1, 1);
+    drawBoneAtOrigin(scale * 0.7, null, { skipBand: true, skipShadow: true });
+    ctx.translate(12 * scale * 0.7, 0);
+    ctx.rotate(-0.45);
+    drawClawAtOrigin(scale);
+    ctx.restore();
+    // Skull on top
+    ctx.save();
+    ctx.translate(x, headY);
+    drawSkullAtOrigin(scale, true, pulse);
+    ctx.restore();
+  }
+
+  // Title + due label — bones are subtle, so the labels do the heavy lifting
+  // for "what is this and when is it due." Title above sprite for stages 0-2,
+  // below the skeleton/monster for 3-4 (so the skull keeps the upper area).
+  if (scale >= 0.85 && !options.hideText) {
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const titleLine = (wrapText(task.title, 14).slice(0, 1)[0] || task.title).slice(0, 16);
+    const dueText = dueLabelText(task);
+    const dueCol = dueLabelColor(stage);
+
+    if (stage >= 3) {
+      // Below the skeleton/monster, stacked: title then due (bigger/brighter)
+      const baseY = y + bob + 26 * scale;
+      ctx.font = '7px "Press Start 2P", monospace';
+      ctx.fillStyle = "#ffe0d0";
+      ctx.fillText(titleLine, x, baseY);
+      ctx.font = '8px "Press Start 2P", monospace';
+      ctx.fillStyle = dueCol;
+      // Outline for readability over the floor
+      ctx.strokeStyle = "#0d0a1a";
+      ctx.lineWidth = 3;
+      ctx.strokeText(dueText, x, baseY + 12 * scale);
+      ctx.fillText(dueText, x, baseY + 12 * scale);
+    } else {
+      // Above the bone(s), title then due label
+      const baseY = y + bob - (stage === 2 ? 22 : 16) * scale;
+      ctx.font = '7px "Press Start 2P", monospace';
+      ctx.fillStyle = "#fff";
+      ctx.fillText(titleLine, x, baseY);
+      ctx.font = '8px "Press Start 2P", monospace';
+      ctx.fillStyle = dueCol;
+      ctx.strokeStyle = "#0d0a1a";
+      ctx.lineWidth = 3;
+      const dueY = y + bob + (stage === 2 ? 14 : 12) * scale;
+      ctx.strokeText(dueText, x, dueY);
+      ctx.fillText(dueText, x, dueY);
+    }
+  }
+}
+
+// Dispatch — call sites use drawTask, not drawOrb directly.
+function drawTask(x, y, task, scale = 1, options = {}) {
+  if (isRecurring(task)) drawRecurringTask(x, y, task, scale, options);
+  else drawOrb(x, y, task, scale, options);
+}
+
 function drawOrb(x, y, task, scale = 1, options = {}) {
   const color = memberById(task.createdBy)?.color || "#888";
   const r = ORB_R * scale;
@@ -835,13 +1500,39 @@ function clampToZone(t) {
   t.y = clamp(t.y, b.top  + ORB_R, b.bottom - ORB_R);
 }
 
+// Static slots for recurring rituals — laid out in a row along the top of
+// the left zone, sorted by template createdAt for stable ordering.
+function recurringSlots() {
+  const b = layout.leftZone;
+  if (!b) return new Map();
+  const recur = state.tasks
+    .filter(t => t.ownerId === state.me && t.status === "active" && isRecurring(t))
+    .sort((a, b2) => (a.createdAt || 0) - (b2.createdAt || 0));
+  const slotW = Math.min(96, (b.right - b.left) / Math.max(recur.length, 1));
+  const cx = (b.left + b.right) / 2;
+  const startX = cx - ((recur.length - 1) * slotW) / 2;
+  const yPos = b.top + 60;
+  const map = new Map();
+  recur.forEach((t, i) => map.set(t.id, { x: startX + i * slotW, y: yPos }));
+  return map;
+}
+
 function step(dt) {
   const b = layout.leftZone;
   if (!b) return;
+  const slots = recurringSlots();
   for (const t of state.tasks) {
     if (t.status !== "active") continue;
     if (t.ownerId !== state.me) continue;
     if (state.drag && state.drag.taskId === t.id) continue;
+
+    // Recurring rituals — static at their slot, no physics.
+    if (isRecurring(t)) {
+      const s = slots.get(t.id);
+      if (s) { t.x = s.x; t.y = s.y; t.vx = 0; t.vy = 0; }
+      continue;
+    }
+
     // Newly-arrived tasks (e.g. taken back from a basket) need a spawn position
     if (t.x == null || t.y == null) assignSpawn(t);
 
@@ -911,7 +1602,7 @@ function render() {
   // Floating tasks on left
   for (const t of tasksOnMyLeft()) {
     if (state.drag && state.drag.taskId === t.id) continue;
-    drawOrb(t.x, t.y, t);
+    drawTask(t.x, t.y, t);
   }
 
   // Teammates + their attached stacks
@@ -940,7 +1631,7 @@ function render() {
       const row = Math.floor(i / 2);
       const ox = tm.x + CHAR_W * 0.55 + col * 14;
       const oy = tm.y - 4 - row * 12 + tbob;
-      drawOrb(ox, oy, t, 0.42 * getDropScale(t.id));
+      drawTask(ox, oy, t, 0.42 * getDropScale(t.id), { hideText: true });
       state.rightOrbHits.push({ taskId: t.id, x: ox, y: oy, r: ORB_R * 0.42 + 4 });
     });
     if (stack.length > 0) {
@@ -970,7 +1661,7 @@ function render() {
       const col = i % 3;
       const ox = bk.x - colStep + col * colStep + (row % 2 ? colStep / 3 : 0);
       const oy = bk.y - 10 - row * 11;
-      drawOrb(ox, oy, t, 0.48 * getDropScale(t.id));
+      drawTask(ox, oy, t, 0.48 * getDropScale(t.id), { hideText: true });
       state.rightOrbHits.push({ taskId: t.id, x: ox, y: oy, r: ORB_R * 0.48 + 4 });
     });
 
@@ -982,7 +1673,7 @@ function render() {
   // Dragged orb on top
   if (state.drag) {
     const t = state.tasks.find(x => x.id === state.drag.taskId);
-    if (t) drawOrb(t.x, t.y, t, 1.1);
+    if (t) drawTask(t.x, t.y, t, 1.1);
   }
 
   // Hover tooltip — full title above the orb under cursor when not dragging
@@ -1186,16 +1877,41 @@ function handleDrop(t, target) {
   const now = Date.now();
   if (target.kind === "person") {
     if (target.id === t.ownerId) { clampToZone(t); save(); return; }
-    t.history.push({ from: t.ownerId, to: target.id, at: now, kind: "transfer" });
+    if (isRecurring(t)) {
+      // Recurring obligations can't be delegated — snap back to my zone.
+      assignSpawn(t);
+      save();
+      showToast(`<em>[BOUND]</em> ${escapeHtml(t.title)}<span class="small">recurring rituals can't be delegated</span>`, "info", 3000);
+      return;
+    }
+    const entry = { from: t.ownerId, to: target.id, at: now, kind: "transfer" };
+    t.history.push(entry);
     t.ownerId = target.id;
     t.x = null; t.y = null; t.vx = 0; t.vy = 0;
-  } else if (target.kind === "bucket") {
-    t.history.push({ from: t.ownerId, to: target.id, at: now, kind: "status" });
-    t.status = target.id; // "done" | "blocked"
+    t.updatedAt = now;
+    state.dropAnim[t.id] = { start: state.t };
+    persist.taskUpdate(t.id, { ownerId: t.ownerId, historyAppend: entry, updatedAt: now });
+    return;
   }
-  t.updatedAt = now;
-  state.dropAnim[t.id] = { start: state.t };
-  save();
+  if (target.kind === "bucket") {
+    const entry = { from: t.ownerId, to: target.id, at: now, kind: "status" };
+    t.history.push(entry);
+    t.status = target.id; // "done" | "blocked"
+    t.updatedAt = now;
+    state.dropAnim[t.id] = { start: state.t };
+    persist.taskUpdate(t.id, { status: t.status, historyAppend: entry, updatedAt: now });
+    // Completing a recurring ritual counts as a check-in. recordCheckin is
+    // idempotent within a day, so the boot-time check-in won't double-fire.
+    if (target.id === "done" && isRecurring(t) && t.ownerId === state.me) {
+      const prev = state.streaks[state.me]?.count || 0;
+      const result = recordCheckin(state.me);
+      if (result.bumped) {
+        updateStreakDisplay(true);
+        updateChargeDisplay();
+        announceCheckin(prev, result);
+      }
+    }
+  }
 }
 
 // Pull a task back to my left zone — either from a teammate (request-back) or a basket (reopen)
@@ -1204,14 +1920,17 @@ function takeBack(taskId) {
   if (!t) return;
   const now = Date.now();
   const kind = t.status === "active" ? "request-back" : "reopen";
-  t.history.push({ from: t.ownerId, to: state.me, at: now, kind });
+  const entry = { from: t.ownerId, to: state.me, at: now, kind };
+  t.history.push(entry);
   t.ownerId = state.me;
   t.status = "active";
   t.x = null; t.y = null; t.vx = 0; t.vy = 0;
   assignSpawn(t);
   t.updatedAt = now;
   state.dropAnim[t.id] = { start: state.t };
-  save();
+  persist.taskUpdate(t.id, {
+    ownerId: t.ownerId, status: t.status, historyAppend: entry, updatedAt: now,
+  });
 }
 
 function getDropScale(taskId) {
@@ -1244,6 +1963,7 @@ function renderIdentity() {
     updateChargeDisplay();
     announceCheckin(prevCount, result);
     computeLayout(layout.w, layout.h);
+    spawnRecurringForMe();
     for (const t of state.tasks) {
       if (t.ownerId === state.me && t.status === "active" && (t.x == null || t.y == null)) {
         assignSpawn(t);
@@ -1279,7 +1999,7 @@ $("#task-form").addEventListener("submit", (e) => {
   };
   assignSpawn(task);
   state.tasks.push(task);
-  save();
+  persist.taskCreate(task);
   $("#task-dialog").close();
 });
 
@@ -1287,9 +2007,11 @@ $("#task-form").addEventListener("submit", (e) => {
 function openDetail(taskId) {
   const t = state.tasks.find(x => x.id === taskId);
   if (!t) return;
-  const due = t.dueDate
-    ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
-    : "no due date";
+  const due = isRecurring(t)
+    ? `${DAY_NAMES_LONG[t.dueDay].toUpperCase()} (${dueLabelText(t)})`
+    : t.dueDate
+      ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
+      : "no due date";
   const creator = memberById(t.createdBy)?.name || t.createdBy;
   const history = t.history.length
     ? `<ul>${t.history.map(h => {
@@ -1314,8 +2036,11 @@ function openDetail(taskId) {
   }
 
   const clientLine = t.client ? ` · CLIENT ${escapeHtml(t.client)}` : "";
+  const ritualBadge = isRecurring(t)
+    ? `<span class="ritual-badge">RITUAL</span> `
+    : "";
   $("#detail-content").innerHTML = `
-    <h3>${escapeHtml(t.title)}</h3>
+    <h3>${ritualBadge}${escapeHtml(t.title)}</h3>
     <div class="meta">FROM ${escapeHtml(creator)} · DUE ${escapeHtml(due)}${clientLine}</div>
     <div class="desc">${t.description ? escapeHtml(t.description) : '<em style="color:#777">no description</em>'}</div>
     <div class="history"><strong>HISTORY</strong>${history}</div>
@@ -1329,7 +2054,7 @@ function openDetail(taskId) {
   $("#del-task").onclick = () => {
     if (confirm("Delete this quest?")) {
       state.tasks = state.tasks.filter(x => x.id !== taskId);
-      save();
+      persist.taskDelete(taskId);
       $("#detail-dialog").close();
     }
   };
@@ -1532,6 +2257,421 @@ function exportCsv() {
 
 $("#open-ledger").addEventListener("click", openLedger);
 
+// === SETTINGS (roster + clients editor) ===
+const settingsState = {
+  tab: "roster",          // "roster" | "clients"
+  newClientText: "",      // preserved across re-renders inside the dialog
+  newMember: null,        // { name, color } while the add-member form is open; null otherwise
+};
+
+function openSettings() {
+  renderSettings();
+  $("#settings-dialog").showModal();
+}
+
+// ESC inside an input usually means "clear/cancel autocomplete", not "close
+// the whole dialog". Suppress the default ESC-close so the only close path
+// is the explicit ✕ button — matches the muscle memory of using the X.
+$("#settings-dialog").addEventListener("cancel", (e) => e.preventDefault());
+
+function memberTaskCounts(memberId) {
+  let owned = 0, active = 0;
+  for (const t of state.tasks) {
+    if (t.ownerId === memberId) {
+      owned++;
+      if (t.status === "active") active++;
+    }
+  }
+  return { owned, active };
+}
+
+function randomMemberColor() {
+  const palette = ["#5b8def","#e8743b","#3aa17a","#9c6bd8","#1bb0c2","#d85ea1","#c2b04a","#7c8aa0"];
+  return palette[Math.floor(Math.random() * palette.length)];
+}
+
+function makeMemberId(name) {
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 12);
+  let id = slug || "member";
+  let n = 1;
+  while (TEAM.find(m => m.id === id)) id = `${slug}${++n}`;
+  return id;
+}
+
+function renderSettings() {
+  const tab = settingsState.tab;
+  const tabsBar = `
+    <div class="settings-tabs">
+      <button class="${tab === "roster"  ? "active" : ""}" data-tab="roster">PARTY (${TEAM.length})</button>
+      <button class="${tab === "clients" ? "active" : ""}" data-tab="clients">CLIENTS (${CLIENTS.length})</button>
+      <button class="close-x" id="close-settings" title="Close">✕</button>
+    </div>
+  `;
+
+  let body = "";
+  if (tab === "roster") {
+    const rows = TEAM.map(m => {
+      const counts = memberTaskCounts(m.id);
+      const isMe = m.id === state.me;
+      const canDelete = counts.active === 0 && TEAM.length > 1;
+      const tooltip = !canDelete
+        ? (TEAM.length <= 1 ? "can't delete the last member" : `holds ${counts.active} active task${counts.active === 1 ? "" : "s"} — reassign first`)
+        : "remove from party";
+      return `
+        <div class="settings-row" data-member-id="${escapeHtml(m.id)}">
+          <span class="swatch" style="background:${escapeHtml(m.color)}"></span>
+          <input class="member-name" type="text" maxlength="20" value="${escapeHtml(m.name)}" />
+          <input class="member-color" type="color" value="${escapeHtml(m.color)}" title="character color" />
+          <span class="member-meta">${counts.owned} task${counts.owned === 1 ? "" : "s"}${isMe ? " · you" : ""}</span>
+          <button class="row-delete" ${canDelete ? "" : "disabled"} title="${escapeHtml(tooltip)}">✕</button>
+        </div>
+      `;
+    }).join("");
+    const addForm = settingsState.newMember
+      ? `
+        <div class="settings-row add-form" id="add-member-form">
+          <span class="swatch" style="background:${escapeHtml(settingsState.newMember.color)}"></span>
+          <input id="new-member-name" type="text" maxlength="20" placeholder="name" value="${escapeHtml(settingsState.newMember.name)}" autofocus />
+          <input id="new-member-color" type="color" value="${escapeHtml(settingsState.newMember.color)}" title="character color" />
+          <button id="new-member-save">add</button>
+          <button id="new-member-cancel">cancel</button>
+        </div>
+      `
+      : `<button class="add-row" id="add-member-btn">+ add member</button>`;
+    body = `
+      <div class="settings-list">
+        ${rows}
+        ${addForm}
+      </div>
+      <p class="settings-hint">edit a name or color and click outside the field to save · ✕ removes a member (only if they have no active tasks)</p>
+    `;
+  } else {
+    const rows = CLIENTS.map(c => {
+      const usage = state.tasks.filter(t => t.client === c).length;
+      return `
+        <div class="settings-row" data-client-name="${escapeHtml(c)}">
+          <input class="client-name" type="text" maxlength="20" value="${escapeHtml(c)}" />
+          <span class="member-meta">${usage} task${usage === 1 ? "" : "s"}</span>
+          <button class="row-delete" title="remove client · existing tasks keep their client name, just stop showing in the filter">✕</button>
+        </div>
+      `;
+    }).join("");
+    body = `
+      <div class="settings-list">
+        ${rows || `<p class="settings-empty">no clients yet</p>`}
+        <div class="settings-row add-form" id="add-client-form">
+          <input id="new-client-name" type="text" maxlength="20" placeholder="new client name" value="${escapeHtml(settingsState.newClientText)}" />
+          <button id="new-client-save">add</button>
+        </div>
+      </div>
+      <p class="settings-hint">edit a name and click outside the field to rename · removing a client doesn't touch existing tasks</p>
+    `;
+  }
+
+  $("#settings-content").innerHTML = `
+    <h2>SETTINGS</h2>
+    ${tabsBar}
+    ${body}
+  `;
+  wireSettingsHandlers();
+}
+
+function wireSettingsHandlers() {
+  $("#close-settings").onclick = () => $("#settings-dialog").close();
+  document.querySelectorAll(".settings-tabs button[data-tab]").forEach(btn => {
+    btn.onclick = () => { settingsState.tab = btn.dataset.tab; renderSettings(); };
+  });
+
+  if (settingsState.tab === "roster") wireRosterHandlers();
+  else wireClientsHandlers();
+}
+
+function wireRosterHandlers() {
+  document.querySelectorAll(".settings-row[data-member-id]").forEach(row => {
+    const id = row.dataset.memberId;
+    const nameInput = row.querySelector(".member-name");
+    const colorInput = row.querySelector(".member-color");
+    const delBtn = row.querySelector(".row-delete");
+
+    const commit = () => {
+      const newName = nameInput.value.trim();
+      const newColor = colorInput.value;
+      const current = TEAM.find(m => m.id === id);
+      if (!current) return;
+      if (newName === current.name && newColor === current.color) return;
+      if (!newName) { nameInput.value = current.name; return; }
+      const next = TEAM.map(m => m.id === id ? { ...m, name: newName, color: newColor } : m);
+      persist.rosterUpdate(next);
+    };
+    nameInput.onchange = commit;
+    colorInput.onchange = commit;
+    nameInput.onkeydown = (e) => { if (e.key === "Enter") nameInput.blur(); };
+
+    if (!delBtn.disabled) {
+      delBtn.onclick = () => {
+        const m = TEAM.find(x => x.id === id);
+        if (!m) return;
+        if (!confirm(`Remove ${m.name} from the party?`)) return;
+        const next = TEAM.filter(x => x.id !== id);
+        persist.rosterUpdate(next);
+      };
+    }
+  });
+
+  const addBtn = $("#add-member-btn");
+  if (addBtn) {
+    addBtn.onclick = () => {
+      settingsState.newMember = { name: "", color: randomMemberColor() };
+      renderSettings();
+    };
+  }
+  if (settingsState.newMember) {
+    const nameEl = $("#new-member-name");
+    const colorEl = $("#new-member-color");
+    const saveEl = $("#new-member-save");
+    const cancelEl = $("#new-member-cancel");
+    nameEl.oninput = () => { settingsState.newMember.name = nameEl.value; };
+    colorEl.oninput = () => { settingsState.newMember.color = colorEl.value; };
+    nameEl.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); saveEl.click(); } if (e.key === "Escape") cancelEl.click(); };
+    cancelEl.onclick = () => { settingsState.newMember = null; renderSettings(); };
+    saveEl.onclick = () => {
+      const name = (settingsState.newMember.name || "").trim();
+      const color = settingsState.newMember.color || randomMemberColor();
+      if (!name) { nameEl.focus(); return; }
+      const id = makeMemberId(name);
+      const next = [...TEAM, { id, name, color }];
+      settingsState.newMember = null;
+      persist.rosterUpdate(next);
+    };
+  }
+}
+
+function wireClientsHandlers() {
+  document.querySelectorAll(".settings-row[data-client-name]").forEach(row => {
+    const current = row.dataset.clientName;
+    const nameInput = row.querySelector(".client-name");
+    const delBtn = row.querySelector(".row-delete");
+    nameInput.onchange = () => {
+      const newName = nameInput.value.trim();
+      if (!CLIENTS.includes(current)) { renderSettings(); return; }     // remote deleted between render and edit
+      if (newName === current) return;
+      if (!newName) { nameInput.value = current; return; }
+      if (CLIENTS.includes(newName)) { nameInput.value = current; showToast(`<em>[CLIENT]</em> ALREADY EXISTS`, "broken", 2500); return; }
+      // Rename warning: existing tasks won't auto-update. Offer to backfill.
+      const usage = state.tasks.filter(t => t.client === current).length;
+      let backfill = false;
+      if (usage > 0) {
+        backfill = confirm(
+          `Rename "${current}" → "${newName}"?\n\n` +
+          `${usage} task${usage === 1 ? "" : "s"} currently use${usage === 1 ? "s" : ""} "${current}".\n\n` +
+          `OK = also update those ${usage} task${usage === 1 ? "" : "s"} to "${newName}" (recommended)\n` +
+          `Cancel = leave tasks pointing at "${current}" (they'll fall out of the filter)`
+        );
+        if (!backfill && !confirm(`Just rename the client without updating tasks?`)) {
+          nameInput.value = current; return;
+        }
+      }
+      const next = CLIENTS.map(c => c === current ? newName : c);
+      persist.clientsUpdate(next);
+      if (backfill) {
+        const now = Date.now();
+        for (const t of state.tasks) {
+          if (t.client === current) {
+            t.client = newName;
+            t.updatedAt = now;
+            persist.taskUpdate(t.id, { client: newName, updatedAt: now });
+          }
+        }
+      }
+    };
+    nameInput.onkeydown = (e) => { if (e.key === "Enter") nameInput.blur(); };
+    delBtn.onclick = () => {
+      if (!CLIENTS.includes(current)) { renderSettings(); return; }
+      const usage = state.tasks.filter(t => t.client === current).length;
+      const msg = usage
+        ? `Remove "${current}"?\n\n${usage} task${usage === 1 ? "" : "s"} reference it. Those tasks will keep "${current}" as their client name (it just won't appear in the filter dropdown anymore).`
+        : `Remove "${current}"?`;
+      if (!confirm(msg)) return;
+      const next = CLIENTS.filter(c => c !== current);
+      persist.clientsUpdate(next);
+    };
+  });
+
+  const nameEl = $("#new-client-name");
+  const saveEl = $("#new-client-save");
+  nameEl.oninput = () => { settingsState.newClientText = nameEl.value; };
+  nameEl.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); saveEl.click(); } };
+  saveEl.onclick = () => {
+    const name = (settingsState.newClientText || "").trim();
+    if (!name) { nameEl.focus(); return; }
+    if (CLIENTS.includes(name)) { showToast(`<em>[CLIENT]</em> ALREADY EXISTS`, "broken", 2500); return; }
+    const next = [...CLIENTS, name];
+    settingsState.newClientText = "";
+    persist.clientsUpdate(next);
+  };
+}
+
+$("#open-settings").addEventListener("click", openSettings);
+
+// === RITUALS (recurring tasks) ===
+let ritualEditing = null;   // template being edited, or null when creating
+
+function openRituals() { renderRituals(); $("#rituals-dialog").showModal(); }
+
+function renderRituals() {
+  const mine = myActiveTemplates();
+  const atCap = mine.length >= RECURRING_MAX_PER_USER;
+  const today = isoDow();
+
+  const rows = mine.length ? mine.map(tpl => {
+    const wk = isoWeekKey();
+    const inst = state.tasks.find(t => t.recurringTemplateId === tpl.id && t.weekKey === wk);
+    const status = inst
+      ? (inst.status === "done" ? "DONE THIS WEEK" : inst.status === "blocked" ? "BLOCKED" : (
+          today < tpl.dueDay ? `DUE ${DAY_NAMES[tpl.dueDay].toUpperCase()}`
+          : today === tpl.dueDay ? "DUE TODAY"
+          : `${today - tpl.dueDay}D OVERDUE`
+        ))
+      : "AWAITING SPAWN";
+    const statusClass = inst && inst.status === "active" && today > tpl.dueDay ? "overdue"
+      : inst && inst.status === "done" ? "done"
+      : inst && inst.status === "blocked" ? "blocked"
+      : "neutral";
+    return `<div class="ritual-row" data-id="${escapeHtml(tpl.id)}">
+      <div class="ritual-main">
+        <div class="ritual-title">${escapeHtml(tpl.title)}</div>
+        <div class="ritual-meta">
+          ${escapeHtml(tpl.client || "—")} ·
+          STARTS ${DAY_NAMES[tpl.startDay].toUpperCase()} ·
+          DUE ${DAY_NAMES[tpl.dueDay].toUpperCase()}
+        </div>
+      </div>
+      <div class="ritual-status ${statusClass}">${status}</div>
+      <div class="ritual-actions">
+        <button class="ritual-edit" data-id="${escapeHtml(tpl.id)}">edit</button>
+        <button class="ritual-delete" data-id="${escapeHtml(tpl.id)}">kill</button>
+      </div>
+    </div>`;
+  }).join("") : `<div class="ritual-empty">No recurring rituals yet. Add one — they live on your side of the wall and bind you to the weekly cycle.</div>`;
+
+  $("#rituals-content").innerHTML = `
+    <div id="rituals-toolbar">
+      <button id="close-rituals">← BACK</button>
+      <h2>WEEKLY RITUALS</h2>
+      <span class="ritual-count">${mine.length} / ${RECURRING_MAX_PER_USER}</span>
+      <button id="add-ritual" ${atCap ? "disabled" : ""}>+ NEW RITUAL</button>
+    </div>
+    <div id="rituals-body">
+      <p class="rituals-blurb">
+        Rituals repeat every week. They live in your zone and can't be delegated.
+        Miss the due day and the crystal grows scarier each day until you drop it in DONE.
+      </p>
+      <div class="ritual-list">${rows}</div>
+    </div>
+  `;
+
+  $("#close-rituals").onclick = () => $("#rituals-dialog").close();
+  const addBtn = document.getElementById("add-ritual");
+  if (addBtn) addBtn.onclick = () => openRitualForm(null);
+  document.querySelectorAll(".ritual-edit").forEach(b => {
+    b.onclick = () => openRitualForm(state.templates.find(x => x.id === b.dataset.id));
+  });
+  document.querySelectorAll(".ritual-delete").forEach(b => {
+    b.onclick = () => deleteRitual(b.dataset.id);
+  });
+}
+
+function dayOptions(selected) {
+  return DAY_NAMES_LONG.map((d, i) =>
+    `<option value="${i}" ${i === selected ? "selected" : ""}>${d}</option>`
+  ).join("");
+}
+
+function openRitualForm(tpl) {
+  ritualEditing = tpl;
+  const form = $("#ritual-form");
+  form.reset();
+  $("#ritual-form-title").textContent = tpl ? "EDIT RITUAL" : "NEW RITUAL";
+  form.elements.startDay.innerHTML = dayOptions(tpl ? tpl.startDay : 0);
+  form.elements.dueDay.innerHTML = dayOptions(tpl ? tpl.dueDay : 4);
+  if (tpl) {
+    form.elements.title.value = tpl.title;
+    form.elements.description.value = tpl.description || "";
+    form.elements.client.value = tpl.client || "";
+  }
+  $("#ritual-edit-dialog").showModal();
+}
+
+function deleteRitual(tplId) {
+  const tpl = state.templates.find(x => x.id === tplId);
+  if (!tpl) return;
+  if (!confirm(`Kill the ritual "${tpl.title}"? Future weeks won't spawn. Existing crystals stay until you complete or delete them.`)) return;
+  tpl.deletedAt = Date.now();
+  persist.templateUpdate(tplId, { deletedAt: tpl.deletedAt });
+  renderRituals();
+}
+
+$("#cancel-ritual").addEventListener("click", () => $("#ritual-edit-dialog").close());
+$("#ritual-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const data = new FormData(e.target);
+  const title = (data.get("title") || "").trim();
+  if (!title) return;
+  const startDay = +data.get("startDay");
+  const dueDay = +data.get("dueDay");
+  const description = (data.get("description") || "").trim();
+  const client = data.get("client") || null;
+  const now = Date.now();
+
+  if (ritualEditing) {
+    const tpl = ritualEditing;
+    tpl.title = title;
+    tpl.description = description;
+    tpl.client = client;
+    tpl.startDay = startDay;
+    tpl.dueDay = dueDay;
+    tpl.updatedAt = now;
+    persist.templateUpdate(tpl.id, { title, description, client, startDay, dueDay, updatedAt: now });
+    // Sync this week's active instance so visible state matches the edit.
+    // Past weeks (done/blocked in baskets) stay as historical snapshots.
+    const wk = isoWeekKey();
+    const inst = state.tasks.find(t =>
+      t.recurringTemplateId === tpl.id && t.weekKey === wk && t.status === "active"
+    );
+    if (inst) {
+      inst.title = title;
+      inst.description = description;
+      inst.client = client;
+      inst.startDay = startDay;
+      inst.dueDay = dueDay;
+      inst.updatedAt = now;
+      persist.taskUpdate(inst.id, { title, description, client, startDay, dueDay, updatedAt: now });
+    }
+  } else {
+    if (myActiveTemplates().length >= RECURRING_MAX_PER_USER) {
+      showToast(`<em>[CAPPED]</em> max ${RECURRING_MAX_PER_USER} rituals per person`, "info", 3000);
+      $("#ritual-edit-dialog").close();
+      return;
+    }
+    const tpl = {
+      id: uid(),
+      ownerId: state.me,
+      title, description, client,
+      startDay, dueDay,
+      createdAt: now, updatedAt: now,
+      deletedAt: null,
+    };
+    state.templates.push(tpl);
+    persist.templateCreate(tpl);
+    spawnRecurringForMe();
+  }
+  ritualEditing = null;
+  $("#ritual-edit-dialog").close();
+  renderRituals();
+});
+
+$("#open-rituals").addEventListener("click", openRituals);
+
 // === TAVERN ===
 function openTavern() { renderTavern(); $("#tavern-dialog").showModal(); }
 
@@ -1641,8 +2781,299 @@ $("#detail-dialog").addEventListener("close", () => {
   if ($("#ledger-dialog").open) renderLedger();
 });
 
+// === FIRESTORE ===
+// Real-time sync layer. Initialised once on boot if firebase-config.js loaded
+// with real values. Hydrates state.tasks from the remote snapshot, then keeps
+// it in sync. Local mutations go through `persist.*` which writes here.
+
+function hasUsableFirebaseConfig() {
+  if (window.__firebaseConfigMissing) return false;
+  const c = window.FIREBASE_CONFIG;
+  if (!c || !c.apiKey || c.apiKey === "REPLACE_ME" || !c.projectId || c.projectId === "REPLACE_ME") return false;
+  if (typeof window.firebase === "undefined") return false;
+  return true;
+}
+
+// Hydration policy: when a Firestore snapshot arrives, the remote doc is the
+// source of truth for everything EXCEPT the physics state of orbs I currently
+// own and am drifting around in my left zone. We preserve local x/y/vx/vy so
+// orbs don't teleport every time a sibling write fires a snapshot.
+function reconcileTaskFromRemote(remote) {
+  const local = state.tasks.find(t => t.id === remote.id);
+  if (!local) {
+    const next = { ...remote, x: null, y: null, vx: 0, vy: 0, history: remote.history || [] };
+    if (next.ownerId === state.me && next.status === "active") assignSpawn(next);
+    return next;
+  }
+  // I own the task and was the one mutating — keep my physics, take remote fields
+  const dragging = state.drag && state.drag.taskId === remote.id;
+  const ownedByMe = remote.ownerId === state.me && remote.status === "active";
+  if (ownedByMe) {
+    return {
+      ...remote,
+      history: remote.history || [],
+      x: dragging ? local.x : (local.x ?? null),
+      y: dragging ? local.y : (local.y ?? null),
+      vx: local.vx ?? 0,
+      vy: local.vy ?? 0,
+    };
+  }
+  // Otherwise (basket / teammate's stack): physics doesn't matter, drop it
+  return { ...remote, history: remote.history || [], x: null, y: null, vx: 0, vy: 0 };
+}
+
+function applyTaskSnapshot(snap) {
+  // Skip echoes from our own local writes that haven't been ack'd by the
+  // server yet — we already mutated state.tasks synchronously in the
+  // mutation site, so reprocessing the same data here just causes a redundant
+  // physics-preservation pass (and can race with an in-flight drag).
+  // We DO process the server-confirmed snapshot that follows.
+  if (snap.metadata && snap.metadata.hasPendingWrites) return;
+
+  // First-hydration migration: if remote is empty but we have phase-1
+  // localStorage tasks, push them up instead of dropping them on the floor.
+  // The writes below will re-trigger this listener; by then fb.hydrated is
+  // true so we fall through to the normal reconcile.
+  if (!fb.hydrated && snap.empty && state.tasks.length > 0) {
+    console.info("[ttm] migrating", state.tasks.length, "phase-1 tasks → Firestore");
+    fb.hydrated = true;
+    for (const t of state.tasks) {
+      fb.db.collection("tasks").doc(t.id).set(stripPhysics(t))
+        .catch(noteWriteFailure);
+    }
+    return;
+  }
+  // Defensive: if remote is empty but we have local tasks AND we're past
+  // hydration, the most likely cause is a rules misconfig that rejected the
+  // migration writes — not "all tasks legitimately deleted". Don't clobber.
+  // The next successful snap reconciles normally; a wholesale delete still
+  // gets through on a subsequent snapshot if it was real.
+  if (fb.hydrated && snap.empty && state.tasks.length > 0) {
+    console.warn("[ttm] empty snapshot with local tasks present — keeping local (likely rules misconfig or transient)");
+    return;
+  }
+  const next = [];
+  snap.forEach(doc => {
+    const remote = { id: doc.id, ...doc.data() };
+    next.push(reconcileTaskFromRemote(remote));
+  });
+  state.tasks = next;
+  for (const t of state.tasks) {
+    if (t.ownerId === state.me && t.status === "active" && (t.x == null || t.y == null)) {
+      assignSpawn(t);
+    }
+  }
+  save();
+  if (!fb.hydrated) {
+    fb.hydrated = true;
+    console.info("[ttm] hydrated", state.tasks.length, "tasks from Firestore");
+  }
+}
+
+// Roster + clients snapshot handlers. Both also handle first-time seeding:
+// when the doc doesn't exist, the current in-memory TEAM/CLIENTS (which came
+// from the localStorage cache or the *_SEED constants) is uploaded.
+function handleRosterSnapshot(doc) {
+  if (!doc.exists) {
+    fb.db.collection("team").doc("roster").set({ members: TEAM })
+      .catch(noteWriteFailure);
+    return;
+  }
+  const data = doc.data();
+  if (!data || !Array.isArray(data.members) || data.members.length === 0) return;
+  TEAM = data.members;
+  saveTeamCached();
+  onTeamChanged();
+}
+
+function handleClientsSnapshot(doc) {
+  if (!doc.exists) {
+    fb.db.collection("team").doc("clients").set({ list: CLIENTS })
+      .catch(noteWriteFailure);
+    return;
+  }
+  const data = doc.data();
+  if (!data || !Array.isArray(data.list)) return;
+  CLIENTS = data.list;
+  saveClientsCached();
+  onClientsChanged();
+}
+
+// Called whenever TEAM is replaced (local edit or remote snapshot). Refreshes
+// any UI that holds member names/colors/options, and self-heals state.me if
+// the current identity got deleted on another browser.
+function onTeamChanged() {
+  if (!TEAM.find(m => m.id === state.me)) {
+    const fallback = TEAM[0];
+    if (fallback) {
+      console.warn("[ttm] active identity removed, falling back to", fallback.id);
+      // Cancel any in-flight drag — it references state.me at start and would
+      // otherwise complete with a stale ownerId, writing a phantom history entry.
+      if (state.drag) {
+        canvas?.classList.remove("grabbing");
+        state.drag = null;
+        state.hoverTarget = null;
+        state.rightClick = null;
+      }
+      showToast(`<em>[ROSTER]</em> YOUR IDENTITY WAS REMOVED<span class="small">playing as ${escapeHtml(fallback.name)}</span>`, "broken", 4500);
+      state.me = fallback.id;
+      localStorage.setItem(STORAGE_ME, state.me);
+    }
+  }
+  renderIdentity();
+  if (typeof layout !== "undefined" && layout && layout.w) computeLayout(layout.w, layout.h);
+  // Suppress the dialog re-render during the echo window after a local write —
+  // the data has already been applied; rerendering would yank the cursor out
+  // of any field the user is typing in. ESC and click-outside still close.
+  if ($("#settings-dialog")?.open && Date.now() - fb.lastLocalRosterWriteAt > ECHO_WINDOW_MS) {
+    renderSettings();
+  }
+}
+
+// Called whenever CLIENTS is replaced. Refreshes any open dropdown that lists
+// clients (new-quest, ritual, ledger filter, settings dialog).
+function onClientsChanged() {
+  refreshClientDropdowns();
+  if ($("#ledger-dialog")?.open) renderLedger();
+  if ($("#settings-dialog")?.open && Date.now() - fb.lastLocalClientsWriteAt > ECHO_WINDOW_MS) {
+    renderSettings();
+  }
+}
+
+// Populates every <select name="client"> in the DOM with the current CLIENTS
+// list, preserving any previously-selected value.
+function refreshClientDropdowns() {
+  document.querySelectorAll('select[name="client"]').forEach(sel => {
+    const prev = sel.value;
+    const opts = [`<option value="">— none —</option>`]
+      .concat(CLIENTS.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`));
+    sel.innerHTML = opts.join("");
+    if (prev && CLIENTS.includes(prev)) sel.value = prev;
+  });
+}
+
+// Pulls streaks for every team member so the Tavern + name labels reflect
+// real data across browsers, not just whoever last logged in here.
+// Pulls streaks for every team member. Recency-guarded: if the local copy
+// already records today's check-in (or a higher count), it wins — otherwise
+// the remote check-in from another browser would clobber a just-recorded one.
+async function hydrateStreaks() {
+  if (!fb.db) return;
+  const snap = await fb.db.collection("users").get();
+  snap.forEach(doc => {
+    const data = doc.data();
+    if (!data || !data.streak) return;
+    const remote = data.streak;
+    const local = state.streaks[doc.id];
+    if (!local) { state.streaks[doc.id] = remote; return; }
+    // Prefer whichever side has the more recent lastDay; tie-break on count.
+    if (remote.lastDay > local.lastDay) state.streaks[doc.id] = remote;
+    else if (remote.lastDay === local.lastDay && remote.count > local.count) state.streaks[doc.id] = remote;
+  });
+  saveStreaks();
+}
+
+async function initFirebase() {
+  if (!hasUsableFirebaseConfig()) {
+    console.info("[ttm] Firebase fallback: running in localStorage mode (see SETUP.md)");
+    return false;
+  }
+  fb.app = firebase.initializeApp(window.FIREBASE_CONFIG);
+  fb.auth = firebase.auth();
+  const db = firebase.firestore();
+
+  // IndexedDB persistence: queues writes when offline, serves reads from cache
+  // on reload before the server responds. Fails on multi-tab without
+  // synchronizeTabs (only one tab can own the cache otherwise); we opt in so
+  // open-in-two-tabs doesn't break.
+  try {
+    await db.enablePersistence({ synchronizeTabs: true });
+  } catch (err) {
+    if (err.code === "failed-precondition")    console.info("[ttm] persistence: another tab owns the cache, skipping");
+    else if (err.code === "unimplemented")     console.info("[ttm] persistence: not supported in this browser, skipping");
+    else                                       console.warn("[ttm] persistence init failed:", err);
+  }
+
+  // Defer assigning fb.db until after auth resolves — otherwise mutation
+  // sites can fire unauthenticated writes during the auth round-trip.
+  try {
+    const cred = await fb.auth.signInAnonymously();
+    fb.uid = cred.user.uid;
+  } catch (err) {
+    console.warn("[ttm] anonymous auth failed:", err);
+    return false;
+  }
+  fb.db = db;
+
+  // Subscribe to tasks immediately — don't block on roster/streak hydration.
+  // Tasks are the hot path; roster + streaks fill in async in parallel.
+  if (fb.unsubTasks) fb.unsubTasks();
+  fb.unsubTasks = fb.db.collection("tasks").onSnapshot(
+    applyTaskSnapshot,
+    err => { console.warn("[ttm] tasks subscription error:", err); noteWriteFailure(err); },
+  );
+
+  // Roster + clients listeners. Both self-seed on first run (if doc doesn't
+  // exist) and feed UI refreshes through onTeamChanged / onClientsChanged.
+  if (fb.unsubRoster) fb.unsubRoster();
+  fb.unsubRoster = fb.db.collection("team").doc("roster").onSnapshot(
+    handleRosterSnapshot,
+    err => console.warn("[ttm] roster subscription error:", err),
+  );
+  if (fb.unsubClients) fb.unsubClients();
+  fb.unsubClients = fb.db.collection("team").doc("clients").onSnapshot(
+    handleClientsSnapshot,
+    err => console.warn("[ttm] clients subscription error:", err),
+  );
+
+  // The boot-time recordCheckin() ran while fb.db was still null, so its
+  // remote write was skipped. Flush it now that we're authed.
+  if (state.streaks[state.me]) persist.streak(state.me);
+
+  hydrateStreaks()
+    .catch(err => console.warn("[ttm] streaks hydration failed:", err));
+  return true;
+}
+
+// === DEBUG (browser console) ===
+// `ttm.rituals()` — list this user's rituals + the current crystal stages.
+// `ttm.bump(taskId, n)` — shift an instance's dueDay back by `n` days to
+// simulate overdueness without changing the system date.
+window.ttm = {
+  state,
+  rituals() {
+    const wk = isoWeekKey();
+    const mine = myActiveTemplates();
+    console.table(mine.map(tpl => {
+      const inst = state.tasks.find(t => t.recurringTemplateId === tpl.id && t.weekKey === wk);
+      return {
+        title: tpl.title,
+        startDay: DAY_NAMES[tpl.startDay],
+        dueDay: DAY_NAMES[tpl.dueDay],
+        instStatus: inst ? inst.status : "(no instance)",
+        instTaskId: inst ? inst.id : "—",
+        daysSinceDue: inst ? daysSinceDue(inst) : "—",
+        stage: inst ? scaryStage(inst) : "—",
+      };
+    }));
+  },
+  bump(taskId, days = 1) {
+    const t = state.tasks.find(x => x.id === taskId);
+    if (!t || !isRecurring(t)) return console.warn("not a recurring task:", taskId);
+    t.dueDay = ((t.dueDay - days) % 7 + 7) % 7;
+    persist.taskUpdate(t.id, { dueDay: t.dueDay });
+    console.log(`bumped ${t.title}: dueDay=${t.dueDay} (${DAY_NAMES[t.dueDay]}), days overdue now=${daysSinceDue(t)}, stage=${scaryStage(t)}`);
+  },
+  stage(taskId) {
+    const t = state.tasks.find(x => x.id === taskId);
+    if (!t || !isRecurring(t)) return console.warn("not a recurring task:", taskId);
+    console.log(`${t.title}: dueDay=${DAY_NAMES[t.dueDay]}, daysSinceDue=${daysSinceDue(t)}, stage=${scaryStage(t)}`);
+  },
+};
+
 // === INIT ===
 renderIdentity();
+refreshClientDropdowns();
 window.addEventListener("resize", resize);
 resize();
 // Daily check-in — loading the app is your "I'm here" signal.
@@ -1651,4 +3082,11 @@ const initialCheckin = recordCheckin(state.me);
 updateStreakDisplay(initialCheckin.bumped);
 updateChargeDisplay();
 announceCheckin(prevInit, initialCheckin);
+// Spawn this week's recurring instances if none exist yet.
+spawnRecurringForMe();
 requestAnimationFrame((t) => { lastT = t; tick(t); });
+
+// Boot Firebase last — by now the local-only path is fully functional, so
+// hydration is purely additive. If the SDK is missing or unconfigured we just
+// keep running in localStorage mode.
+initFirebase();
