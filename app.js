@@ -713,13 +713,35 @@ function computeLayout(w, h) {
   // Decide basket orientation: side-by-side on wide screens, stacked vertically on narrow ones.
   const basketsStacked = rzW < BASKET_W * 2 + 60;
 
-  // Allocate vertical space: teammates 56%, baskets 44%. Baskets stacked need a bit more.
-  const peopleFrac = basketsStacked ? 0.50 : 0.58;
+  // Allocate vertical space: teammates 56%, baskets 44%. A dense team (6+ people)
+  // claws back some basket space so the grid doesn't cram. Baskets stacked
+  // need slightly less of that bonus since they're already tall.
+  const denseTeam = others.length >= 6;
+  const peopleFrac = basketsStacked
+    ? (denseTeam ? 0.62 : 0.50)
+    : (denseTeam ? 0.68 : 0.58);
   const peopleH = rzH * peopleFrac;
   const basketsH = rzH - peopleH;
 
-  // Teammate grid: 1 col on narrow right zones, 2 cols otherwise. Cell sizes capped.
-  const cols = rzW < 220 ? 1 : Math.min(2, others.length);
+  // Teammate grid: column count grows to absorb vertical pressure first, then
+  // is capped by what fits horizontally. A "comfortable cell" is at least
+  // MIN_CELL_W and MIN_CELL_H.
+  //
+  // 72 — chosen to unlock 2-col on all common phone widths (360–430). The
+  // right zone at 360 viewport is ~147px → floor(147/72)=2. Tight: the orb
+  // stack would crash the neighbor at this width, so the render code switches
+  // to single-column stack when `teammateCellW < 100`.
+  // 90 — sprite 48 + name label 14 above + title label 14 below = 76, plus
+  // a bit of breathing room. (Title is hidden when cellH<75 anyway.)
+  const MIN_CELL_W = 72;
+  const MIN_CELL_H = 90;
+  const maxColsByWidth = Math.max(1, Math.floor(rzW / MIN_CELL_W));
+  let cols = 1;
+  while (
+    cols < maxColsByWidth &&
+    Math.ceil(others.length / cols) * MIN_CELL_H > peopleH
+  ) cols++;
+  cols = Math.max(1, Math.min(cols, others.length));
   const rows = Math.ceil(others.length / cols);
   const cellW = Math.min(rzW / cols, 220);
   const cellH = Math.min(peopleH / Math.max(rows, 1), 130);
@@ -728,6 +750,8 @@ function computeLayout(w, h) {
   const gridLeft = rz.left + (rzW - gridW) / 2;
   const gridTop = rz.top + Math.max(8, (peopleH - gridH) / 2);
 
+  layout.teammateCellH = cellH;
+  layout.teammateCellW = cellW;
   layout.teammates = others.map((m, i) => {
     const col = i % cols;
     const row = Math.floor(i / cols);
@@ -1606,13 +1630,16 @@ function render() {
   }
 
   // Teammates + their attached stacks
+  const tmDense = layout.teammateCellH != null && layout.teammateCellH < 75;
   for (const tm of layout.teammates) {
     const tbob = Math.sin(state.t / 360 + tm.x) * 2;
     const tmStreak = getStreak(tm.id);
     drawAura(tm.x, tm.y, tmStreak);
     drawCharacter(tm.x, tm.y, tm.color, tbob);
     drawNameLabel(tm.x, tm.y - CHAR_H / 2 - 14, tm.name, tmStreak);
-    drawTitleLabel(tm.x, tm.y + CHAR_H / 2 + 12, tmStreak);
+    // Skip title in dense grids — there's no room and it visually merges with
+    // the next row's character. Title still shows in the Tavern.
+    if (!tmDense) drawTitleLabel(tm.x, tm.y + CHAR_H / 2 + 12, tmStreak);
 
     // Hover highlight ring
     if (state.hoverTarget && state.hoverTarget.kind === "person" && state.hoverTarget.id === tm.id) {
@@ -1623,20 +1650,30 @@ function render() {
       ctx.stroke();
     }
 
-    // Stack of orbs piled to the right of the teammate — reads as carried loot
+    // Stack of orbs piled to the right of the teammate — reads as carried loot.
+    // On narrow cells (phone 2-col), shrink to a single vertical column so the
+    // stack doesn't crash into the neighbor's character.
     const stack = tasksOnTeammate(tm.id);
+    const stackCols = (layout.teammateCellW != null && layout.teammateCellW < 100) ? 1 : 2;
     const visibleStack = stack.slice(0, 8);
     visibleStack.forEach((t, i) => {
-      const col = i % 2;
-      const row = Math.floor(i / 2);
+      const col = i % stackCols;
+      const row = Math.floor(i / stackCols);
       const ox = tm.x + CHAR_W * 0.55 + col * 14;
       const oy = tm.y - 4 - row * 12 + tbob;
       drawTask(ox, oy, t, 0.42 * getDropScale(t.id), { hideText: true });
       state.rightOrbHits.push({ taskId: t.id, x: ox, y: oy, r: ORB_R * 0.42 + 4 });
     });
     if (stack.length > 0) {
-      const badgeX = tm.x + CHAR_W * 0.55 + 16;
-      const badgeY = tm.y - 4 - Math.floor((visibleStack.length - 1) / 2) * 12 - 16;
+      // Clamp badge to the right zone so it doesn't get cut off on narrow phones.
+      // Badge sits at the top-right of the visible stack; offset depends on
+      // whether stack is 1 or 2 columns wide.
+      const stackRightOffset = stackCols === 1 ? 4 : 16;
+      const desiredX = tm.x + CHAR_W * 0.55 + stackRightOffset;
+      const badgeX = Math.min(desiredX, layout.rightZone.right - 12);
+      const topRow = Math.floor((visibleStack.length - 1) / stackCols);
+      const desiredY = tm.y - 4 - topRow * 12 - 16;
+      const badgeY = Math.max(desiredY, layout.rightZone.top + 12);
       drawCountBadge(badgeX, badgeY, stack.length);
     }
   }
