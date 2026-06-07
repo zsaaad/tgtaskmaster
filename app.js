@@ -1479,23 +1479,72 @@ function renderIdentity() {
   };
 }
 
-$("#new-task").addEventListener("click", () => {
+// Task form is reused for create + edit. taskFormCtx.mode controls behaviour.
+const taskFormCtx = { mode: "create", editingId: null };
+
+function openTaskCreateForm() {
+  taskFormCtx.mode = "create";
+  taskFormCtx.editingId = null;
   $("#task-form").reset();
+  $("#task-form h2").textContent = "NEW QUEST";
+  $("#task-form button[type=submit]").textContent = "create";
   $("#task-dialog").showModal();
+}
+
+function openTaskEditForm(taskId) {
+  const t = state.tasks.find(x => x.id === taskId);
+  if (!t) return;
+  taskFormCtx.mode = "edit";
+  taskFormCtx.editingId = taskId;
+  const form = $("#task-form");
+  form.reset();
+  form.elements.title.value = t.title || "";
+  form.elements.description.value = t.description || "";
+  form.elements.client.value = t.client || "";
+  form.elements.dueDate.value = t.dueDate || "";
+  $("#task-form h2").textContent = "EDIT QUEST";
+  $("#task-form button[type=submit]").textContent = "save";
+  $("#task-dialog").showModal();
+}
+
+$("#new-task").addEventListener("click", openTaskCreateForm);
+$("#cancel-task").addEventListener("click", () => {
+  const wasEditing = taskFormCtx.mode === "edit" && taskFormCtx.editingId;
+  const id = taskFormCtx.editingId;
+  $("#task-dialog").close();
+  if (wasEditing) openDetail(id);
 });
-$("#cancel-task").addEventListener("click", () => $("#task-dialog").close());
 $("#task-form").addEventListener("submit", (e) => {
   e.preventDefault();
   const data = new FormData(e.target);
   const title = (data.get("title") || "").trim();
   if (!title) return;
+  const description = (data.get("description") || "").trim();
+  const client = data.get("client") || null;
+  const dueDate = data.get("dueDate") || null;
   const now = Date.now();
+
+  if (taskFormCtx.mode === "edit" && taskFormCtx.editingId) {
+    const t = state.tasks.find(x => x.id === taskFormCtx.editingId);
+    if (!t) { $("#task-dialog").close(); return; }
+    t.title = title;
+    t.description = description;
+    t.client = client;
+    t.dueDate = dueDate;
+    t.updatedAt = now;
+    persist.taskUpdate(t.id, { title, description, client, dueDate, updatedAt: now });
+    const editedId = t.id;
+    $("#task-dialog").close();
+    openDetail(editedId);
+    return;
+  }
+
   const task = {
     id: uid(),
     title,
-    description: (data.get("description") || "").trim(),
-    client: data.get("client") || null,
-    dueDate: data.get("dueDate") || null,
+    description,
+    client,
+    dueDate,
     status: "active",
     ownerId: state.me,
     createdBy: state.me,
@@ -1541,6 +1590,7 @@ function openDetail(taskId) {
 
   const clientLine = t.client ? ` · CLIENT ${escapeHtml(t.client)}` : "";
   $("#detail-content").innerHTML = `
+    <button class="edit-pencil" id="edit-task" title="edit quest" aria-label="edit quest">✎</button>
     <h3>${escapeHtml(t.title)}</h3>
     <div class="meta">FROM ${escapeHtml(creator)} · DUE ${escapeHtml(due)}${clientLine}</div>
     <div class="desc">${t.description ? escapeHtml(t.description) : '<em style="color:#777">no description</em>'}</div>
@@ -1552,6 +1602,10 @@ function openDetail(taskId) {
     </div>
   `;
   $("#detail-dialog").showModal();
+  $("#edit-task").onclick = () => {
+    $("#detail-dialog").close();
+    openTaskEditForm(taskId);
+  };
   $("#del-task").onclick = () => {
     if (confirm("Delete this quest?")) {
       state.tasks = state.tasks.filter(x => x.id !== taskId);
