@@ -25,7 +25,6 @@
     <span id="charge-display" class="zero" title="Torch charges (streak insurance)">
       <span class="shield">🛡</span><span class="charge-num">0</span>
     </span>
-    <button id="open-rituals">RITUALS</button>
     <button id="open-ledger">LEDGER</button>
     <button id="open-settings" title="Manage party + clients">SETTINGS</button>
     <button id="new-task">+ new quest</button>
@@ -62,29 +61,12 @@
     <div id="tavern-content"></div>
   </dialog>
 
-  <dialog id="rituals-dialog">
-    <div id="rituals-content"></div>
+  <dialog id="basket-dialog">
+    <div id="basket-content"></div>
   </dialog>
 
   <dialog id="settings-dialog">
     <div id="settings-content"></div>
-  </dialog>
-
-  <dialog id="ritual-edit-dialog">
-    <form id="ritual-form" method="dialog">
-      <h2 id="ritual-form-title">NEW RITUAL</h2>
-      <label>Title<input name="title" required maxlength="40" autocomplete="off" /></label>
-      <label>Description<textarea name="description" rows="3"></textarea></label>
-      <label>Client
-        <select name="client"><option value="">— none —</option></select>
-      </label>
-      <label>Starts<select name="startDay"></select></label>
-      <label>Due by<select name="dueDay"></select></label>
-      <div class="actions">
-        <button type="button" id="cancel-ritual">cancel</button>
-        <button type="submit">save</button>
-      </div>
-    </form>
   </dialog>
 
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>

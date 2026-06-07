@@ -23,7 +23,6 @@ let CLIENTS = loadClientsCached();
 const STORAGE_TASKS     = "toss.tasks.v2";
 const STORAGE_ME        = "toss.me.v2";
 const STORAGE_STREAKS   = "toss.streaks.v2";
-const STORAGE_TEMPLATES = "toss.templates.v1";
 const STORAGE_TEAM      = "toss.team.v1";
 const STORAGE_CLIENTS   = "toss.clients.v1";
 
@@ -50,11 +49,6 @@ function loadClientsCached() {
   return ["Toggle", "Unitar", "City U"];
 }
 function saveClientsCached() { localStorage.setItem(STORAGE_CLIENTS, JSON.stringify(CLIENTS)); }
-
-const RECURRING_MAX_PER_USER = 3;
-// 0 = Monday … 6 = Sunday (ISO week ordering)
-const DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const DAY_NAMES_LONG = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
 const SCALE = 3;                  // 1 sprite-pixel = SCALE screen px (characters, wall)
 const BASKET_SCALE = 4;           // baskets render larger so they read as prominent containers
@@ -97,15 +91,16 @@ const ECHO_WINDOW_MS = 600;
 const state = {
   me: localStorage.getItem(STORAGE_ME) || TEAM[0].id,
   tasks: loadTasks(),
-  templates: loadTemplates(),     // recurring weekly task templates (see CLAUDE.md)
   streaks: loadStreaks(),         // userId -> { lastDay: "YYYY-MM-DD", count: number }
   drag: null,                     // { taskId, offX, offY, startX, startY, moved, path: [{x,y,t}] }
   hoverTarget: null,              // { kind, id } highlighted as drop target while dragging
   hoverOrbId: null,               // task id under cursor when not dragging
+  hoverBasketId: null,            // basket id under cursor when not dragging (for click affordance)
   dropAnim: {},                   // taskId -> { start: stateT } for landed-on-target pop
   t: 0,                           // game time, ms
-  rightOrbHits: [],               // { taskId, x, y, r } populated each render for stack/basket click-targeting
-  rightClick: null,               // { taskId, startX, startY } pending click on a right-side orb
+  rightOrbHits: [],               // { taskId, x, y, r } populated each render for stack click-targeting
+  basketHits: [],                 // { id, x, y, w, h } populated each render for basket click-targeting
+  rightClick: null,               // { kind, taskId?, basketId?, startX, startY } pending click on a right-side target
 };
 
 function loadTasks() {
@@ -118,31 +113,6 @@ function loadTasks() {
       history: t.history || [],
     }));
   } catch { return []; }
-}
-
-function loadTemplates() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(STORAGE_TEMPLATES) || "[]");
-    return raw.map(tpl => ({ deletedAt: null, ...tpl }));
-  } catch { return []; }
-}
-function saveTemplates() { localStorage.setItem(STORAGE_TEMPLATES, JSON.stringify(state.templates)); }
-
-// ISO week key — Monday-anchored, computed in UTC so it doesn't flip a day
-// early for users near midnight. Returns "YYYY-Www" (e.g. "2026-W21").
-function isoWeekKey(d = new Date()) {
-  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  // Shift to nearest Thursday — ISO week year pivots on Thursday.
-  t.setUTCDate(t.getUTCDate() + 4 - (t.getUTCDay() || 7));
-  const jan4 = new Date(Date.UTC(t.getUTCFullYear(), 0, 4));
-  const wk = 1 + Math.round((t - jan4) / 604800000);
-  return `${t.getUTCFullYear()}-W${String(wk).padStart(2, "0")}`;
-}
-
-// Monday-anchored day-of-week, 0..6 (Mon=0). Matches DAY_NAMES indexing.
-function isoDow(d = new Date()) {
-  const js = d.getDay();   // 0=Sun..6=Sat
-  return (js + 6) % 7;     // 0=Mon..6=Sun
 }
 
 function loadStreaks() {
@@ -394,20 +364,6 @@ const persist = {
         .catch(noteWriteFailure);
     }
   },
-  templateCreate(tpl) {
-    saveTemplates();
-    if (fb.db) {
-      fb.db.collection("recurringTemplates").doc(tpl.id).set(tpl)
-        .catch(noteWriteFailure);
-    }
-  },
-  templateUpdate(tplId, fields) {
-    saveTemplates();
-    if (fb.db) {
-      fb.db.collection("recurringTemplates").doc(tplId).set(fields, { merge: true })
-        .catch(noteWriteFailure);
-    }
-  },
   rosterUpdate(members) {
     TEAM = members;
     saveTeamCached();
@@ -442,93 +398,6 @@ function isOverdue(t) { return t.dueDate && new Date(t.dueDate) < startOfToday()
 function isDueToday(t) {
   if (!t.dueDate) return false;
   return new Date(t.dueDate).toDateString() === startOfToday().toDateString();
-}
-
-// --- RECURRING ---
-function isRecurring(t) { return !!t.recurringTemplateId; }
-
-// Days since the task's dueDay within its weekKey. Negative = not yet due.
-// 0 = due today, +N = N days overdue.
-function daysSinceDue(t) {
-  if (!isRecurring(t) || t.dueDay == null || !t.weekKey) return -Infinity;
-  // weekKey = "YYYY-Www" — Monday of that ISO week, in UTC.
-  const m = /^(\d{4})-W(\d{2})$/.exec(t.weekKey);
-  if (!m) return -Infinity;
-  const year = +m[1], week = +m[2];
-  // Jan 4 is always in ISO week 1. Find that week's Monday, then add (week-1)*7.
-  const jan4 = new Date(Date.UTC(year, 0, 4));
-  const jan4Dow = jan4.getUTCDay() || 7;   // 1=Mon..7=Sun
-  const week1Monday = new Date(Date.UTC(year, 0, 4 - (jan4Dow - 1)));
-  const dueUtc = new Date(week1Monday.getTime() + ((week - 1) * 7 + t.dueDay) * 86400000);
-  const dueLocal = new Date(dueUtc.getUTCFullYear(), dueUtc.getUTCMonth(), dueUtc.getUTCDate());
-  const today = startOfToday();
-  return Math.round((today - dueLocal) / 86400000);
-}
-
-// Status text + color for a recurring task — shown on canvas and in popup.
-function dueLabelText(t) {
-  if (!isRecurring(t)) return "";
-  const d = daysSinceDue(t);
-  const dayName = DAY_NAMES[t.dueDay].toUpperCase();
-  if (t.status === "done")    return "DONE THIS WEEK";
-  if (t.status === "blocked") return "BLOCKED";
-  if (d < 0)  return `DUE ${dayName} · IN ${-d}D`;
-  if (d === 0) return `DUE TODAY (${dayName})`;
-  if (d === 1) return `1 DAY LATE`;
-  return `${d} DAYS LATE`;
-}
-function dueLabelColor(stage) {
-  return ["#c8c2dc", "#ffd070", "#ff8a60", "#ff5048", "#ff3030"][stage];
-}
-
-// 0 = before due day · 1 = due today · 2 = +1d · 3 = +3d · 4 = +5d or more
-function scaryStage(t) {
-  if (!isRecurring(t)) return 0;
-  const d = daysSinceDue(t);
-  if (d < 0)  return 0;
-  if (d < 1)  return 1;
-  if (d < 3)  return 2;
-  if (d < 5)  return 3;
-  return 4;
-}
-
-function myActiveTemplates() {
-  return state.templates.filter(tpl => tpl.ownerId === state.me && !tpl.deletedAt);
-}
-
-// Idempotent: for each of my active templates, ensure exactly one active
-// instance exists for the current ISO week. Called on app init, identity
-// switch, and right after a template is created.
-function spawnRecurringForMe() {
-  const wk = isoWeekKey();
-  for (const tpl of myActiveTemplates()) {
-    const exists = state.tasks.find(t =>
-      t.recurringTemplateId === tpl.id && t.weekKey === wk
-    );
-    if (exists) continue;
-    const now = Date.now();
-    const task = {
-      id: uid(),
-      title: tpl.title,
-      description: tpl.description || "",
-      client: tpl.client || null,
-      dueDate: null,                    // recurring tasks use dueDay-of-week, not a calendar date
-      status: "active",
-      ownerId: tpl.ownerId,
-      createdBy: tpl.ownerId,
-      history: [],
-      x: null, y: null, vx: 0, vy: 0,
-      recurringTemplateId: tpl.id,
-      weekKey: wk,
-      startDay: tpl.startDay,
-      dueDay: tpl.dueDay,
-      createdAt: now,
-      updatedAt: now,
-    };
-    assignSpawn(task);
-    state.tasks.push(task);
-    persist.taskCreate(task);
-  }
 }
 
 function escapeHtml(s) {
@@ -1041,12 +910,12 @@ function drawTitleLabel(cx, cyTarget, streak) {
   ctx.fillText(title.text, cx, safeCy + 1);
 }
 
-function drawCountBadge(cx, cy, n) {
+function drawCountBadge(cx, cy, n, scale = 1) {
   if (!n) return;
-  ctx.font = '8px "Press Start 2P", monospace';
+  ctx.font = `${Math.round(8 * scale)}px "Press Start 2P", monospace`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  const r = 10;
+  const r = 10 * scale;
   ctx.fillStyle = "#e85a20";
   ctx.beginPath();
   ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -1075,386 +944,8 @@ function wrapText(text, maxLen) {
   return lines;
 }
 
-// === RECURRING — BONE / SKELETON / MONSTER PROGRESSION ===
-// Stage 0: one bone (small, casual, owner-color ribbon).
-// Stage 1: one bone, amber due-today glow + faster pulse.
-// Stage 2: a pile of crossed bones — work accumulating.
-// Stage 3: sitting skeleton (skull + spine + arms hanging).
-// Stage 4: skeletal monster (glowing eyes, fanged jaw, raised claws, smoke, halo).
-// Stays bone-cream through stage 3; red-eye/halo enter only at stage 4 so the
-// "monster is here" moment lands as a single hard signal.
 
-const BONE_COLOR    = "#e8dec0";
-const BONE_SHADE    = "#9a8c6a";
-const BONE_OUTLINE  = "#0d0a1a";
-
-// Draws a horizontal bone at the current transform origin. Caller does
-// translate + rotate. Optional owner-color ribbon tied around the shaft.
-function drawBoneAtOrigin(s, ownerColor, opts = {}) {
-  const w = 22 * s;
-  const h = 8 * s;
-  const headR = h * 0.6;
-  const shaftH = h * 0.7;
-  const ow = Math.max(1.5, s * 1.8);
-
-  // shadow blob
-  if (!opts.skipShadow) {
-    ctx.fillStyle = "rgba(0,0,0,0.32)";
-    ctx.beginPath();
-    ctx.ellipse(0, h * 0.85, w * 0.42, h * 0.2, 0, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // outline (single unioned region: two big circles + a fat rect)
-  ctx.fillStyle = BONE_OUTLINE;
-  ctx.beginPath();
-  ctx.arc(-w/2 + headR, 0, headR + ow, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(w/2 - headR, 0, headR + ow, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillRect(-w/2 + headR, -shaftH/2 - ow, w - 2 * headR, shaftH + 2 * ow);
-
-  // bone fill
-  ctx.fillStyle = BONE_COLOR;
-  ctx.beginPath();
-  ctx.arc(-w/2 + headR, 0, headR, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(w/2 - headR, 0, headR, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillRect(-w/2 + headR, -shaftH/2, w - 2 * headR, shaftH);
-
-  // lower shading (warm tan)
-  ctx.fillStyle = BONE_SHADE;
-  ctx.globalAlpha = 0.32;
-  ctx.beginPath();
-  ctx.arc(-w/2 + headR, 0, headR, 0, Math.PI);
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(w/2 - headR, 0, headR, 0, Math.PI);
-  ctx.fill();
-  ctx.fillRect(-w/2 + headR, 0, w - 2 * headR, shaftH/2);
-  ctx.globalAlpha = 1;
-
-  // owner-color ribbon — tied around the shaft, vertical stripe
-  if (ownerColor && !opts.skipBand) {
-    ctx.fillStyle = ownerColor;
-    ctx.fillRect(-1.6 * s, -shaftH/2 - 1, 3.2 * s, shaftH + 2);
-    ctx.fillStyle = shade(ownerColor, -40);
-    ctx.fillRect(-1.6 * s, shaftH/2 - 0.5, 3.2 * s, 1);
-  }
-
-  // top-left highlight on left head
-  ctx.fillStyle = "rgba(255,255,255,0.45)";
-  ctx.beginPath();
-  ctx.arc(-w/2 + headR - 1, -1.5, headR * 0.32, 0, Math.PI * 2);
-  ctx.fill();
-}
-
-// Pixel-style skull at current origin. `monster=true` enlarges + opens jaw.
-function drawSkullAtOrigin(s, monster, pulse) {
-  const w = (monster ? 15 : 11) * s;
-  const h = (monster ? 14 : 10) * s;
-  const ow = Math.max(1.5, s * 1.8);
-
-  // outline
-  ctx.fillStyle = BONE_OUTLINE;
-  ctx.beginPath();
-  ctx.ellipse(0, 0, w/2 + ow, h/2 + ow, 0, 0, Math.PI * 2);
-  ctx.fill();
-
-  // fill
-  ctx.fillStyle = BONE_COLOR;
-  ctx.beginPath();
-  ctx.ellipse(0, 0, w/2, h/2, 0, 0, Math.PI * 2);
-  ctx.fill();
-
-  // lower jaw shading
-  ctx.fillStyle = BONE_SHADE;
-  ctx.globalAlpha = 0.28;
-  ctx.beginPath();
-  ctx.ellipse(0, h * 0.15, w/2 * 0.92, h/2 * 0.85, 0, 0, Math.PI);
-  ctx.fill();
-  ctx.globalAlpha = 1;
-
-  // eye sockets
-  const eyeR = w * (monster ? 0.18 : 0.14);
-  const eyeY = -h * 0.06;
-  const eyeOffX = w * 0.24;
-
-  if (monster) {
-    // dark socket + glowing red eye
-    ctx.fillStyle = "#000";
-    ctx.beginPath(); ctx.arc(-eyeOffX, eyeY, eyeR + 1.2, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc( eyeOffX, eyeY, eyeR + 1.2, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = "#ff4848";
-    ctx.globalAlpha = 0.55 + pulse * 0.45;
-    ctx.beginPath(); ctx.arc(-eyeOffX, eyeY, eyeR, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc( eyeOffX, eyeY, eyeR, 0, Math.PI * 2); ctx.fill();
-    ctx.globalAlpha = 1;
-  } else {
-    ctx.fillStyle = "#0d0a1a";
-    ctx.beginPath(); ctx.arc(-eyeOffX, eyeY, eyeR, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc( eyeOffX, eyeY, eyeR, 0, Math.PI * 2); ctx.fill();
-  }
-
-  // nose triangle
-  ctx.fillStyle = "#0d0a1a";
-  ctx.beginPath();
-  ctx.moveTo(0, h * 0.08);
-  ctx.lineTo(-w * 0.06, h * 0.22);
-  ctx.lineTo( w * 0.06, h * 0.22);
-  ctx.closePath();
-  ctx.fill();
-
-  // jaw / teeth
-  if (monster) {
-    // open mouth — dark gap with fangs
-    ctx.fillStyle = "#0d0a1a";
-    ctx.fillRect(-w * 0.33, h * 0.28, w * 0.66, h * 0.22);
-    // fangs — 4 alternating top/bottom triangles
-    ctx.fillStyle = BONE_COLOR;
-    const fangN = 4;
-    const fangW = (w * 0.62) / fangN;
-    for (let i = 0; i < fangN; i++) {
-      const fx = -w * 0.31 + i * fangW + fangW / 2;
-      const topFang = i % 2 === 0;
-      if (topFang) {
-        ctx.beginPath();
-        ctx.moveTo(fx - fangW * 0.35, h * 0.28);
-        ctx.lineTo(fx + fangW * 0.35, h * 0.28);
-        ctx.lineTo(fx, h * 0.46);
-        ctx.closePath();
-      } else {
-        ctx.beginPath();
-        ctx.moveTo(fx - fangW * 0.35, h * 0.50);
-        ctx.lineTo(fx + fangW * 0.35, h * 0.50);
-        ctx.lineTo(fx, h * 0.30);
-        ctx.closePath();
-      }
-      ctx.fill();
-    }
-  } else {
-    // closed mouth — horizontal teeth strip
-    ctx.fillStyle = "#0d0a1a";
-    ctx.fillRect(-w * 0.27, h * 0.30, w * 0.54, h * 0.09);
-    ctx.fillStyle = BONE_COLOR;
-    for (let i = 0; i < 4; i++) {
-      ctx.fillRect(-w * 0.24 + i * w * 0.12, h * 0.31, w * 0.05, h * 0.07);
-    }
-  }
-}
-
-// Draws a clawed forearm + 3-finger hand at current origin, pointing +x.
-function drawClawAtOrigin(s) {
-  drawBoneAtOrigin(s * 0.55, null, { skipBand: true, skipShadow: true });
-  ctx.save();
-  ctx.translate(11 * s * 0.55, 0);
-  ctx.fillStyle = BONE_OUTLINE;
-  for (let i = -1; i <= 1; i++) {
-    ctx.beginPath();
-    ctx.moveTo(0, i * 2 * s);
-    ctx.lineTo(6 * s, i * 3.4 * s);
-    ctx.lineTo(1 * s, i * 2 * s + 1.6 * s);
-    ctx.closePath();
-    ctx.fillStyle = BONE_COLOR;
-    ctx.fill();
-    ctx.strokeStyle = BONE_OUTLINE;
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  }
-  ctx.restore();
-}
-
-function drawRecurringTask(x, y, task, scale = 1, options = {}) {
-  const stage = options.stageOverride != null ? options.stageOverride : scaryStage(task);
-  const ownerColor = memberById(task.ownerId)?.color || "#888";
-
-  const pulseSpeed = [400, 220, 160, 130, 90][stage];
-  let pulse = 0.7 + Math.sin(state.t / pulseSpeed + (task.x || 0) * 0.013) * 0.2;
-  if (stage === 2) pulse += (Math.random() - 0.5) * 0.12;
-  pulse = clamp(pulse, 0.5, 1);
-
-  const bob = Math.sin(state.t / 380 + (task.x || 0) * 0.01) * 1.5 * scale;
-
-  // Stage 4 — drifting smoke aura behind everything
-  if (stage === 4) {
-    for (let i = 0; i < 4; i++) {
-      const phase = state.t / 600 + i * 1.4 + (task.x || 0) * 0.01;
-      const sx = x + Math.sin(phase) * 13 * scale;
-      const sy = y - 16 * scale - ((state.t / 32 + i * 48) % 64) * 0.42;
-      const sr = scale * (8 + i * 1.6);
-      ctx.fillStyle = `rgba(40,12,28,${0.20 - i * 0.04})`;
-      ctx.beginPath();
-      ctx.arc(sx, sy, sr, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  // Stage 4 — pulsing red halo
-  if (stage === 4) {
-    const haloR = 24 * scale + Math.sin(state.t / 90) * 2;
-    ctx.strokeStyle = `rgba(255,40,40,${0.20 + pulse * 0.22})`;
-    ctx.lineWidth = 2.4;
-    ctx.beginPath();
-    ctx.arc(x, y + bob, haloR, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
-  // Stage 1 — amber due-today aura
-  if (stage === 1) {
-    ctx.fillStyle = "#e8b840";
-    ctx.globalAlpha = 0.20 * pulse;
-    ctx.beginPath();
-    ctx.ellipse(x, y + bob, 17 * scale, 9 * scale, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalAlpha = 1;
-  }
-
-  if (stage <= 1) {
-    // One bone — gentle tilt + idle bob
-    const angle = -0.12 + Math.sin(state.t / 720 + (task.x || 0) * 0.01) * 0.08;
-    ctx.save();
-    ctx.translate(x, y + bob);
-    ctx.rotate(angle);
-    drawBoneAtOrigin(scale, ownerColor);
-    ctx.restore();
-  } else if (stage === 2) {
-    // Pile of 3 bones — overlapping at different rotations
-    ctx.save();
-    ctx.translate(x, y + bob + 4 * scale);
-    ctx.rotate(-0.35);
-    drawBoneAtOrigin(scale * 0.95, ownerColor);
-    ctx.restore();
-    ctx.save();
-    ctx.translate(x + 2 * scale, y + bob - 1 * scale);
-    ctx.rotate(0.5);
-    drawBoneAtOrigin(scale * 0.9, ownerColor, { skipBand: true });
-    ctx.restore();
-    ctx.save();
-    ctx.translate(x - 1 * scale, y + bob - 6 * scale);
-    ctx.rotate(-0.08);
-    drawBoneAtOrigin(scale * 0.82, ownerColor, { skipBand: true });
-    ctx.restore();
-  } else if (stage === 3) {
-    // Sitting skeleton — skull + small spine + arms hanging
-    const headY = y + bob - 10 * scale;
-    // Spine — 3 vertebrae below skull
-    for (let i = 0; i < 3; i++) {
-      const vy = headY + (7 + i * 4) * scale;
-      ctx.fillStyle = BONE_OUTLINE;
-      ctx.fillRect(x - 3.5 * scale, vy, 7 * scale, 3 * scale);
-      ctx.fillStyle = BONE_COLOR;
-      ctx.fillRect(x - 2.8 * scale, vy + 0.6, 5.6 * scale, 1.8 * scale);
-    }
-    // Owner-color belt at hip
-    ctx.fillStyle = ownerColor;
-    ctx.fillRect(x - 4 * scale, headY + 19 * scale, 8 * scale, 2 * scale);
-    ctx.fillStyle = shade(ownerColor, -40);
-    ctx.fillRect(x - 4 * scale, headY + 20.5 * scale, 8 * scale, 0.6 * scale);
-    // Arms hanging at sides — short bones angled down
-    ctx.save();
-    ctx.translate(x - 4 * scale, headY + 9 * scale);
-    ctx.rotate(-Math.PI / 2 - 0.25);
-    drawBoneAtOrigin(scale * 0.55, null, { skipBand: true, skipShadow: true });
-    ctx.restore();
-    ctx.save();
-    ctx.translate(x + 4 * scale, headY + 9 * scale);
-    ctx.rotate(Math.PI / 2 + 0.25);
-    drawBoneAtOrigin(scale * 0.55, null, { skipBand: true, skipShadow: true });
-    ctx.restore();
-    // Skull last (on top of spine)
-    ctx.save();
-    ctx.translate(x, headY);
-    drawSkullAtOrigin(scale, false, pulse);
-    ctx.restore();
-  } else {
-    // Stage 4 — monster: raised claws + spine + open-jaw skull
-    const headY = y + bob - 14 * scale;
-    // Spine
-    ctx.fillStyle = BONE_OUTLINE;
-    ctx.fillRect(x - 2 * scale, headY + 11 * scale, 4 * scale, 14 * scale);
-    ctx.fillStyle = BONE_COLOR;
-    ctx.fillRect(x - 1.3 * scale, headY + 11 * scale, 2.6 * scale, 14 * scale);
-    // Hip belt — owner color
-    ctx.fillStyle = ownerColor;
-    ctx.fillRect(x - 5 * scale, headY + 24 * scale, 10 * scale, 2.5 * scale);
-    // Raised arms with claws — both pointing up-and-out
-    const armWiggle = Math.sin(state.t / 260) * 0.1;
-    // left arm
-    ctx.save();
-    ctx.translate(x - 3 * scale, headY + 12 * scale);
-    ctx.rotate(-Math.PI * 0.6 - armWiggle);
-    drawBoneAtOrigin(scale * 0.7, null, { skipBand: true, skipShadow: true });
-    ctx.translate(12 * scale * 0.7, 0);
-    ctx.rotate(-0.45);
-    drawClawAtOrigin(scale);
-    ctx.restore();
-    // right arm
-    ctx.save();
-    ctx.translate(x + 3 * scale, headY + 12 * scale);
-    ctx.rotate(Math.PI * 0.6 + armWiggle);
-    ctx.scale(-1, 1);
-    drawBoneAtOrigin(scale * 0.7, null, { skipBand: true, skipShadow: true });
-    ctx.translate(12 * scale * 0.7, 0);
-    ctx.rotate(-0.45);
-    drawClawAtOrigin(scale);
-    ctx.restore();
-    // Skull on top
-    ctx.save();
-    ctx.translate(x, headY);
-    drawSkullAtOrigin(scale, true, pulse);
-    ctx.restore();
-  }
-
-  // Title + due label — bones are subtle, so the labels do the heavy lifting
-  // for "what is this and when is it due." Title above sprite for stages 0-2,
-  // below the skeleton/monster for 3-4 (so the skull keeps the upper area).
-  if (scale >= 0.85 && !options.hideText) {
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    const titleLine = (wrapText(task.title, 14).slice(0, 1)[0] || task.title).slice(0, 16);
-    const dueText = dueLabelText(task);
-    const dueCol = dueLabelColor(stage);
-
-    if (stage >= 3) {
-      // Below the skeleton/monster, stacked: title then due (bigger/brighter)
-      const baseY = y + bob + 26 * scale;
-      ctx.font = '7px "Press Start 2P", monospace';
-      ctx.fillStyle = "#ffe0d0";
-      ctx.fillText(titleLine, x, baseY);
-      ctx.font = '8px "Press Start 2P", monospace';
-      ctx.fillStyle = dueCol;
-      // Outline for readability over the floor
-      ctx.strokeStyle = "#0d0a1a";
-      ctx.lineWidth = 3;
-      ctx.strokeText(dueText, x, baseY + 12 * scale);
-      ctx.fillText(dueText, x, baseY + 12 * scale);
-    } else {
-      // Above the bone(s), title then due label
-      const baseY = y + bob - (stage === 2 ? 22 : 16) * scale;
-      ctx.font = '7px "Press Start 2P", monospace';
-      ctx.fillStyle = "#fff";
-      ctx.fillText(titleLine, x, baseY);
-      ctx.font = '8px "Press Start 2P", monospace';
-      ctx.fillStyle = dueCol;
-      ctx.strokeStyle = "#0d0a1a";
-      ctx.lineWidth = 3;
-      const dueY = y + bob + (stage === 2 ? 14 : 12) * scale;
-      ctx.strokeText(dueText, x, dueY);
-      ctx.fillText(dueText, x, dueY);
-    }
-  }
-}
-
-// Dispatch — call sites use drawTask, not drawOrb directly.
 function drawTask(x, y, task, scale = 1, options = {}) {
-  if (isRecurring(task)) drawRecurringTask(x, y, task, scale, options);
-  else drawOrb(x, y, task, scale, options);
-}
-
-function drawOrb(x, y, task, scale = 1, options = {}) {
   const color = memberById(task.createdBy)?.color || "#888";
   const r = ORB_R * scale;
 
@@ -1524,38 +1015,13 @@ function clampToZone(t) {
   t.y = clamp(t.y, b.top  + ORB_R, b.bottom - ORB_R);
 }
 
-// Static slots for recurring rituals — laid out in a row along the top of
-// the left zone, sorted by template createdAt for stable ordering.
-function recurringSlots() {
-  const b = layout.leftZone;
-  if (!b) return new Map();
-  const recur = state.tasks
-    .filter(t => t.ownerId === state.me && t.status === "active" && isRecurring(t))
-    .sort((a, b2) => (a.createdAt || 0) - (b2.createdAt || 0));
-  const slotW = Math.min(96, (b.right - b.left) / Math.max(recur.length, 1));
-  const cx = (b.left + b.right) / 2;
-  const startX = cx - ((recur.length - 1) * slotW) / 2;
-  const yPos = b.top + 60;
-  const map = new Map();
-  recur.forEach((t, i) => map.set(t.id, { x: startX + i * slotW, y: yPos }));
-  return map;
-}
-
 function step(dt) {
   const b = layout.leftZone;
   if (!b) return;
-  const slots = recurringSlots();
   for (const t of state.tasks) {
     if (t.status !== "active") continue;
     if (t.ownerId !== state.me) continue;
     if (state.drag && state.drag.taskId === t.id) continue;
-
-    // Recurring rituals — static at their slot, no physics.
-    if (isRecurring(t)) {
-      const s = slots.get(t.id);
-      if (s) { t.x = s.x; t.y = s.y; t.vx = 0; t.vy = 0; }
-      continue;
-    }
 
     // Newly-arrived tasks (e.g. taken back from a basket) need a spawn position
     if (t.x == null || t.y == null) assignSpawn(t);
@@ -1606,8 +1072,9 @@ function tasksInBasket(status) {
 
 // === RENDER ===
 function render() {
-  // Reset per-frame hit registry for right-side (stack + basket) orbs
+  // Reset per-frame hit registries for right-side click targeting.
   state.rightOrbHits.length = 0;
+  state.basketHits.length = 0;
 
   // Static background (floor + wall body) from cache; animated torches on top.
   if (bgCache) {
@@ -1678,33 +1145,31 @@ function render() {
     }
   }
 
-  // Baskets + their contents
+  // Baskets — clickable containers; the basket itself is the affordance.
+  // Orbs no longer pile visibly inside; the count badge carries the info, and
+  // tapping the basket opens a popup listing what's in it.
   for (const bk of layout.baskets) {
     drawBasket(bk.x, bk.y, bk.light, bk.dark);
+    state.basketHits.push({ id: bk.id, x: bk.x, y: bk.y, w: BASKET_W, h: BASKET_H });
 
-    // Hover highlight
+    // Drag drop-target hover (drawn while dragging an orb over it)
     if (state.hoverTarget && state.hoverTarget.kind === "bucket" && state.hoverTarget.id === bk.id) {
       ctx.strokeStyle = "#ffd070";
       ctx.lineWidth = 3;
       ctx.strokeRect(bk.x - BASKET_W / 2 - 2, bk.y - BASKET_H / 2 - 2, BASKET_W + 4, BASKET_H + 4);
     }
-
-    // Orbs piled inside, peeking out of the open top — spaced for the bigger basket
-    const items = tasksInBasket(bk.id);
-    const visibleItems = items.slice(0, 9);
-    const colStep = BASKET_W / 4;
-    visibleItems.forEach((t, i) => {
-      const row = Math.floor(i / 3);
-      const col = i % 3;
-      const ox = bk.x - colStep + col * colStep + (row % 2 ? colStep / 3 : 0);
-      const oy = bk.y - 10 - row * 11;
-      drawTask(ox, oy, t, 0.48 * getDropScale(t.id), { hideText: true });
-      state.rightOrbHits.push({ taskId: t.id, x: ox, y: oy, r: ORB_R * 0.48 + 4 });
-    });
+    // Click-affordance ring — softer, only when hovered without a drag in progress
+    else if (state.hoverBasketId === bk.id && !state.drag) {
+      const pulse = 0.6 + Math.sin(state.t / 220) * 0.25;
+      ctx.strokeStyle = `rgba(255, 208, 112, ${pulse.toFixed(2)})`;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bk.x - BASKET_W / 2 - 1, bk.y - BASKET_H / 2 - 1, BASKET_W + 2, BASKET_H + 2);
+    }
 
     // Label below
     drawNameLabel(bk.x, bk.y + BASKET_H / 2 + 14, bk.label);
-    if (items.length > 0) drawCountBadge(bk.x + BASKET_W / 2 + 4, bk.y - BASKET_H / 2 + 2, items.length);
+    const count = tasksInBasket(bk.id).length;
+    if (count > 0) drawCountBadge(bk.x + BASKET_W / 2 + 6, bk.y - BASKET_H / 2 + 2, count, 1.5);
   }
 
   // Dragged orb on top
@@ -1780,6 +1245,16 @@ function pickRightOrbAt(x, y) {
   return null;
 }
 
+function pickBasketAt(x, y) {
+  for (const h of state.basketHits) {
+    if (
+      x >= h.x - h.w / 2 && x <= h.x + h.w / 2 &&
+      y >= h.y - h.h / 2 && y <= h.y + h.h / 2
+    ) return h.id;
+  }
+  return null;
+}
+
 function hitTestTarget(x, y) {
   // Teammates — generous hit radius so the player doesn't fight the target
   for (const tm of layout.teammates) {
@@ -1815,10 +1290,17 @@ canvas.addEventListener("pointerdown", (e) => {
     canvas.classList.add("grabbing");
     return;
   }
-  // Right-side orbs (on teammates or in baskets) are click-only — opens detail with take-back
+  // Right-side orbs on teammate stacks — click opens detail with take-back
   const rt = pickRightOrbAt(p.x, p.y);
   if (rt) {
-    state.rightClick = { taskId: rt.id, startX: p.x, startY: p.y };
+    state.rightClick = { kind: "orb", taskId: rt.id, startX: p.x, startY: p.y };
+    canvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  // Baskets — click opens the basket popup listing every task piled inside.
+  const bId = pickBasketAt(p.x, p.y);
+  if (bId) {
+    state.rightClick = { kind: "basket", basketId: bId, startX: p.x, startY: p.y };
     canvas.setPointerCapture(e.pointerId);
   }
 });
@@ -1843,8 +1325,10 @@ canvas.addEventListener("pointermove", (e) => {
   } else {
     // hover cursor + tooltip target
     const orb = pickOrbAt(p.x, p.y);
-    canvas.classList.toggle("over-orb", !!orb);
+    const basketId = orb ? null : pickBasketAt(p.x, p.y);
+    canvas.classList.toggle("over-orb", !!orb || !!basketId);
     state.hoverOrbId = orb ? orb.id : null;
+    state.hoverBasketId = basketId;
   }
 });
 
@@ -1856,7 +1340,8 @@ canvas.addEventListener("pointerup", (e) => {
     state.rightClick = null;
     canvas.releasePointerCapture(e.pointerId);
     if (Math.hypot(p.x - click.startX, p.y - click.startY) < DRAG_THRESHOLD) {
-      openDetail(click.taskId);
+      if (click.kind === "basket") openBasket(click.basketId);
+      else openDetail(click.taskId);
     }
     return;
   }
@@ -1914,13 +1399,6 @@ function handleDrop(t, target) {
   const now = Date.now();
   if (target.kind === "person") {
     if (target.id === t.ownerId) { clampToZone(t); save(); return; }
-    if (isRecurring(t)) {
-      // Recurring obligations can't be delegated — snap back to my zone.
-      assignSpawn(t);
-      save();
-      showToast(`<em>[BOUND]</em> ${escapeHtml(t.title)}<span class="small">recurring rituals can't be delegated</span>`, "info", 3000);
-      return;
-    }
     const entry = { from: t.ownerId, to: target.id, at: now, kind: "transfer" };
     t.history.push(entry);
     t.ownerId = target.id;
@@ -1937,17 +1415,6 @@ function handleDrop(t, target) {
     t.updatedAt = now;
     state.dropAnim[t.id] = { start: state.t };
     persist.taskUpdate(t.id, { status: t.status, historyAppend: entry, updatedAt: now });
-    // Completing a recurring ritual counts as a check-in. recordCheckin is
-    // idempotent within a day, so the boot-time check-in won't double-fire.
-    if (target.id === "done" && isRecurring(t) && t.ownerId === state.me) {
-      const prev = state.streaks[state.me]?.count || 0;
-      const result = recordCheckin(state.me);
-      if (result.bumped) {
-        updateStreakDisplay(true);
-        updateChargeDisplay();
-        announceCheckin(prev, result);
-      }
-    }
   }
 }
 
@@ -2000,7 +1467,6 @@ function renderIdentity() {
     updateChargeDisplay();
     announceCheckin(prevCount, result);
     computeLayout(layout.w, layout.h);
-    spawnRecurringForMe();
     for (const t of state.tasks) {
       if (t.ownerId === state.me && t.status === "active" && (t.x == null || t.y == null)) {
         assignSpawn(t);
@@ -2044,11 +1510,9 @@ $("#task-form").addEventListener("submit", (e) => {
 function openDetail(taskId) {
   const t = state.tasks.find(x => x.id === taskId);
   if (!t) return;
-  const due = isRecurring(t)
-    ? `${DAY_NAMES_LONG[t.dueDay].toUpperCase()} (${dueLabelText(t)})`
-    : t.dueDate
-      ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
-      : "no due date";
+  const due = t.dueDate
+    ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
+    : "no due date";
   const creator = memberById(t.createdBy)?.name || t.createdBy;
   const history = t.history.length
     ? `<ul>${t.history.map(h => {
@@ -2073,11 +1537,8 @@ function openDetail(taskId) {
   }
 
   const clientLine = t.client ? ` · CLIENT ${escapeHtml(t.client)}` : "";
-  const ritualBadge = isRecurring(t)
-    ? `<span class="ritual-badge">RITUAL</span> `
-    : "";
   $("#detail-content").innerHTML = `
-    <h3>${ritualBadge}${escapeHtml(t.title)}</h3>
+    <h3>${escapeHtml(t.title)}</h3>
     <div class="meta">FROM ${escapeHtml(creator)} · DUE ${escapeHtml(due)}${clientLine}</div>
     <div class="desc">${t.description ? escapeHtml(t.description) : '<em style="color:#777">no description</em>'}</div>
     <div class="history"><strong>HISTORY</strong>${history}</div>
@@ -2101,6 +1562,61 @@ function openDetail(taskId) {
     $("#detail-dialog").close();
   };
   $("#close-detail").onclick = () => $("#detail-dialog").close();
+}
+
+// === BASKET POPUP ===
+function timeAgo(ts) {
+  const diff = Date.now() - ts;
+  const m = Math.floor(diff / 60000);
+  if (m < 1)   return "just now";
+  if (m < 60)  return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24)  return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 30)  return `${d}d ago`;
+  const mo = Math.floor(d / 30);
+  if (mo < 12) return `${mo}mo ago`;
+  return `${Math.floor(mo / 12)}y ago`;
+}
+
+function openBasket(status) {
+  const label = status === "done" ? "DONE" : "BLOCKED";
+  const items = tasksInBasket(status).slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  const rows = items.length
+    ? items.map(t => {
+        const owner = memberById(t.ownerId)?.name || t.ownerId;
+        const creator = memberById(t.createdBy)?.name || t.createdBy;
+        const clientBit = t.client ? ` · ${escapeHtml(t.client)}` : "";
+        const meta = `BY ${escapeHtml(creator)} → ${escapeHtml(owner)}${clientBit}`;
+        const when = timeAgo(t.updatedAt || t.createdAt || Date.now());
+        return `<div class="basket-row" data-id="${escapeHtml(t.id)}">
+          <div>
+            <div class="basket-title">${escapeHtml(t.title)}</div>
+            <div class="basket-meta">${meta}</div>
+          </div>
+          <div class="basket-when">${escapeHtml(when)}</div>
+        </div>`;
+      }).join("")
+    : `<div class="basket-empty">Nothing piled in here yet.</div>`;
+
+  $("#basket-content").innerHTML = `
+    <div id="basket-toolbar">
+      <h2>${label}</h2>
+      <span class="basket-count">${items.length} ${items.length === 1 ? "QUEST" : "QUESTS"}</span>
+      <button id="close-basket">CLOSE</button>
+    </div>
+    <div id="basket-list">${rows}</div>
+  `;
+  $("#basket-dialog").showModal();
+  $("#close-basket").onclick = () => $("#basket-dialog").close();
+  document.querySelectorAll("#basket-list .basket-row").forEach(row => {
+    row.onclick = () => {
+      const id = row.dataset.id;
+      $("#basket-dialog").close();
+      openDetail(id);
+    };
+  });
 }
 
 // === LEDGER ===
@@ -2550,165 +2066,6 @@ function wireClientsHandlers() {
 
 $("#open-settings").addEventListener("click", openSettings);
 
-// === RITUALS (recurring tasks) ===
-let ritualEditing = null;   // template being edited, or null when creating
-
-function openRituals() { renderRituals(); $("#rituals-dialog").showModal(); }
-
-function renderRituals() {
-  const mine = myActiveTemplates();
-  const atCap = mine.length >= RECURRING_MAX_PER_USER;
-  const today = isoDow();
-
-  const rows = mine.length ? mine.map(tpl => {
-    const wk = isoWeekKey();
-    const inst = state.tasks.find(t => t.recurringTemplateId === tpl.id && t.weekKey === wk);
-    const status = inst
-      ? (inst.status === "done" ? "DONE THIS WEEK" : inst.status === "blocked" ? "BLOCKED" : (
-          today < tpl.dueDay ? `DUE ${DAY_NAMES[tpl.dueDay].toUpperCase()}`
-          : today === tpl.dueDay ? "DUE TODAY"
-          : `${today - tpl.dueDay}D OVERDUE`
-        ))
-      : "AWAITING SPAWN";
-    const statusClass = inst && inst.status === "active" && today > tpl.dueDay ? "overdue"
-      : inst && inst.status === "done" ? "done"
-      : inst && inst.status === "blocked" ? "blocked"
-      : "neutral";
-    return `<div class="ritual-row" data-id="${escapeHtml(tpl.id)}">
-      <div class="ritual-main">
-        <div class="ritual-title">${escapeHtml(tpl.title)}</div>
-        <div class="ritual-meta">
-          ${escapeHtml(tpl.client || "—")} ·
-          STARTS ${DAY_NAMES[tpl.startDay].toUpperCase()} ·
-          DUE ${DAY_NAMES[tpl.dueDay].toUpperCase()}
-        </div>
-      </div>
-      <div class="ritual-status ${statusClass}">${status}</div>
-      <div class="ritual-actions">
-        <button class="ritual-edit" data-id="${escapeHtml(tpl.id)}">edit</button>
-        <button class="ritual-delete" data-id="${escapeHtml(tpl.id)}">kill</button>
-      </div>
-    </div>`;
-  }).join("") : `<div class="ritual-empty">No recurring rituals yet. Add one — they live on your side of the wall and bind you to the weekly cycle.</div>`;
-
-  $("#rituals-content").innerHTML = `
-    <div id="rituals-toolbar">
-      <button id="close-rituals">← BACK</button>
-      <h2>WEEKLY RITUALS</h2>
-      <span class="ritual-count">${mine.length} / ${RECURRING_MAX_PER_USER}</span>
-      <button id="add-ritual" ${atCap ? "disabled" : ""}>+ NEW RITUAL</button>
-    </div>
-    <div id="rituals-body">
-      <p class="rituals-blurb">
-        Rituals repeat every week. They live in your zone and can't be delegated.
-        Miss the due day and the crystal grows scarier each day until you drop it in DONE.
-      </p>
-      <div class="ritual-list">${rows}</div>
-    </div>
-  `;
-
-  $("#close-rituals").onclick = () => $("#rituals-dialog").close();
-  const addBtn = document.getElementById("add-ritual");
-  if (addBtn) addBtn.onclick = () => openRitualForm(null);
-  document.querySelectorAll(".ritual-edit").forEach(b => {
-    b.onclick = () => openRitualForm(state.templates.find(x => x.id === b.dataset.id));
-  });
-  document.querySelectorAll(".ritual-delete").forEach(b => {
-    b.onclick = () => deleteRitual(b.dataset.id);
-  });
-}
-
-function dayOptions(selected) {
-  return DAY_NAMES_LONG.map((d, i) =>
-    `<option value="${i}" ${i === selected ? "selected" : ""}>${d}</option>`
-  ).join("");
-}
-
-function openRitualForm(tpl) {
-  ritualEditing = tpl;
-  const form = $("#ritual-form");
-  form.reset();
-  $("#ritual-form-title").textContent = tpl ? "EDIT RITUAL" : "NEW RITUAL";
-  form.elements.startDay.innerHTML = dayOptions(tpl ? tpl.startDay : 0);
-  form.elements.dueDay.innerHTML = dayOptions(tpl ? tpl.dueDay : 4);
-  if (tpl) {
-    form.elements.title.value = tpl.title;
-    form.elements.description.value = tpl.description || "";
-    form.elements.client.value = tpl.client || "";
-  }
-  $("#ritual-edit-dialog").showModal();
-}
-
-function deleteRitual(tplId) {
-  const tpl = state.templates.find(x => x.id === tplId);
-  if (!tpl) return;
-  if (!confirm(`Kill the ritual "${tpl.title}"? Future weeks won't spawn. Existing crystals stay until you complete or delete them.`)) return;
-  tpl.deletedAt = Date.now();
-  persist.templateUpdate(tplId, { deletedAt: tpl.deletedAt });
-  renderRituals();
-}
-
-$("#cancel-ritual").addEventListener("click", () => $("#ritual-edit-dialog").close());
-$("#ritual-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const data = new FormData(e.target);
-  const title = (data.get("title") || "").trim();
-  if (!title) return;
-  const startDay = +data.get("startDay");
-  const dueDay = +data.get("dueDay");
-  const description = (data.get("description") || "").trim();
-  const client = data.get("client") || null;
-  const now = Date.now();
-
-  if (ritualEditing) {
-    const tpl = ritualEditing;
-    tpl.title = title;
-    tpl.description = description;
-    tpl.client = client;
-    tpl.startDay = startDay;
-    tpl.dueDay = dueDay;
-    tpl.updatedAt = now;
-    persist.templateUpdate(tpl.id, { title, description, client, startDay, dueDay, updatedAt: now });
-    // Sync this week's active instance so visible state matches the edit.
-    // Past weeks (done/blocked in baskets) stay as historical snapshots.
-    const wk = isoWeekKey();
-    const inst = state.tasks.find(t =>
-      t.recurringTemplateId === tpl.id && t.weekKey === wk && t.status === "active"
-    );
-    if (inst) {
-      inst.title = title;
-      inst.description = description;
-      inst.client = client;
-      inst.startDay = startDay;
-      inst.dueDay = dueDay;
-      inst.updatedAt = now;
-      persist.taskUpdate(inst.id, { title, description, client, startDay, dueDay, updatedAt: now });
-    }
-  } else {
-    if (myActiveTemplates().length >= RECURRING_MAX_PER_USER) {
-      showToast(`<em>[CAPPED]</em> max ${RECURRING_MAX_PER_USER} rituals per person`, "info", 3000);
-      $("#ritual-edit-dialog").close();
-      return;
-    }
-    const tpl = {
-      id: uid(),
-      ownerId: state.me,
-      title, description, client,
-      startDay, dueDay,
-      createdAt: now, updatedAt: now,
-      deletedAt: null,
-    };
-    state.templates.push(tpl);
-    persist.templateCreate(tpl);
-    spawnRecurringForMe();
-  }
-  ritualEditing = null;
-  $("#ritual-edit-dialog").close();
-  renderRituals();
-});
-
-$("#open-rituals").addEventListener("click", openRituals);
-
 // === TAVERN ===
 function openTavern() { renderTavern(); $("#tavern-dialog").showModal(); }
 
@@ -2968,7 +2325,7 @@ function onTeamChanged() {
 }
 
 // Called whenever CLIENTS is replaced. Refreshes any open dropdown that lists
-// clients (new-quest, ritual, ledger filter, settings dialog).
+// clients (new-quest, ledger filter, settings dialog).
 function onClientsChanged() {
   refreshClientDropdowns();
   if ($("#ledger-dialog")?.open) renderLedger();
@@ -3073,40 +2430,7 @@ async function initFirebase() {
 }
 
 // === DEBUG (browser console) ===
-// `ttm.rituals()` — list this user's rituals + the current crystal stages.
-// `ttm.bump(taskId, n)` — shift an instance's dueDay back by `n` days to
-// simulate overdueness without changing the system date.
-window.ttm = {
-  state,
-  rituals() {
-    const wk = isoWeekKey();
-    const mine = myActiveTemplates();
-    console.table(mine.map(tpl => {
-      const inst = state.tasks.find(t => t.recurringTemplateId === tpl.id && t.weekKey === wk);
-      return {
-        title: tpl.title,
-        startDay: DAY_NAMES[tpl.startDay],
-        dueDay: DAY_NAMES[tpl.dueDay],
-        instStatus: inst ? inst.status : "(no instance)",
-        instTaskId: inst ? inst.id : "—",
-        daysSinceDue: inst ? daysSinceDue(inst) : "—",
-        stage: inst ? scaryStage(inst) : "—",
-      };
-    }));
-  },
-  bump(taskId, days = 1) {
-    const t = state.tasks.find(x => x.id === taskId);
-    if (!t || !isRecurring(t)) return console.warn("not a recurring task:", taskId);
-    t.dueDay = ((t.dueDay - days) % 7 + 7) % 7;
-    persist.taskUpdate(t.id, { dueDay: t.dueDay });
-    console.log(`bumped ${t.title}: dueDay=${t.dueDay} (${DAY_NAMES[t.dueDay]}), days overdue now=${daysSinceDue(t)}, stage=${scaryStage(t)}`);
-  },
-  stage(taskId) {
-    const t = state.tasks.find(x => x.id === taskId);
-    if (!t || !isRecurring(t)) return console.warn("not a recurring task:", taskId);
-    console.log(`${t.title}: dueDay=${DAY_NAMES[t.dueDay]}, daysSinceDue=${daysSinceDue(t)}, stage=${scaryStage(t)}`);
-  },
-};
+window.ttm = { state };
 
 // === INIT ===
 renderIdentity();
@@ -3119,8 +2443,6 @@ const initialCheckin = recordCheckin(state.me);
 updateStreakDisplay(initialCheckin.bumped);
 updateChargeDisplay();
 announceCheckin(prevInit, initialCheckin);
-// Spawn this week's recurring instances if none exist yet.
-spawnRecurringForMe();
 requestAnimationFrame((t) => { lastT = t; tick(t); });
 
 // Boot Firebase last — by now the local-only path is fully functional, so
