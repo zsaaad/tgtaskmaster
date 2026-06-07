@@ -96,11 +96,12 @@ const state = {
   hoverTarget: null,              // { kind, id } highlighted as drop target while dragging
   hoverOrbId: null,               // task id under cursor when not dragging
   hoverBasketId: null,            // basket id under cursor when not dragging (for click affordance)
+  hoverStackTm: null,             // teammate id whose stack-orb is hovered (for click affordance)
   dropAnim: {},                   // taskId -> { start: stateT } for landed-on-target pop
   t: 0,                           // game time, ms
-  rightOrbHits: [],               // { taskId, x, y, r } populated each render for stack click-targeting
   basketHits: [],                 // { id, x, y, w, h } populated each render for basket click-targeting
-  rightClick: null,               // { kind, taskId?, basketId?, startX, startY } pending click on a right-side target
+  stackHits: [],                  // { teammateId, x, y, r } populated each render for teammate-stack-orb click-targeting
+  rightClick: null,               // { kind, basketId?, teammateId?, startX, startY } pending click on a right-side target
 };
 
 function loadTasks() {
@@ -1073,8 +1074,8 @@ function tasksInBasket(status) {
 // === RENDER ===
 function render() {
   // Reset per-frame hit registries for right-side click targeting.
-  state.rightOrbHits.length = 0;
   state.basketHits.length = 0;
+  state.stackHits.length = 0;
 
   // Static background (floor + wall body) from cache; animated torches on top.
   if (bgCache) {
@@ -1117,31 +1118,35 @@ function render() {
       ctx.stroke();
     }
 
-    // Stack of orbs piled to the right of the teammate — reads as carried loot.
-    // On narrow cells (phone 2-col), shrink to a single vertical column so the
-    // stack doesn't crash into the neighbor's character.
+    // Single representative orb to the right of the teammate — clickable.
+    // Color = most-recently-updated task's creator so the "who sent it" cue
+    // for the topmost item still reads at a glance. Count badge shows total.
+    // Clicking opens the same list popup the baskets use.
     const stack = tasksOnTeammate(tm.id);
-    const stackCols = (layout.teammateCellW != null && layout.teammateCellW < 100) ? 1 : 2;
-    const visibleStack = stack.slice(0, 8);
-    visibleStack.forEach((t, i) => {
-      const col = i % stackCols;
-      const row = Math.floor(i / stackCols);
-      const ox = tm.x + CHAR_W * 0.55 + col * 14;
-      const oy = tm.y - 4 - row * 12 + tbob;
-      drawTask(ox, oy, t, 0.42 * getDropScale(t.id), { hideText: true });
-      state.rightOrbHits.push({ taskId: t.id, x: ox, y: oy, r: ORB_R * 0.42 + 4 });
-    });
     if (stack.length > 0) {
-      // Clamp badge to the right zone so it doesn't get cut off on narrow phones.
-      // Badge sits at the top-right of the visible stack; offset depends on
-      // whether stack is 1 or 2 columns wide.
-      const stackRightOffset = stackCols === 1 ? 4 : 16;
-      const desiredX = tm.x + CHAR_W * 0.55 + stackRightOffset;
-      const badgeX = Math.min(desiredX, layout.rightZone.right - 12);
-      const topRow = Math.floor((visibleStack.length - 1) / stackCols);
-      const desiredY = tm.y - 4 - topRow * 12 - 16;
-      const badgeY = Math.max(desiredY, layout.rightZone.top + 12);
-      drawCountBadge(badgeX, badgeY, stack.length);
+      const top = stack.slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+      const orbScale = 0.8;
+      const ox = Math.min(tm.x + CHAR_W * 0.55 + 8, layout.rightZone.right - ORB_R * orbScale - 4);
+      const oy = tm.y - 2 + tbob;
+
+      // Soft pulsing affordance ring when hovered (and not dragging)
+      if (state.hoverStackTm === tm.id && !state.drag) {
+        const pulse = 0.5 + Math.sin(state.t / 220) * 0.25;
+        ctx.strokeStyle = `rgba(255, 208, 112, ${pulse.toFixed(2)})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(ox, oy, ORB_R * orbScale + 4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      drawTask(ox, oy, top, orbScale * getDropScale(top.id), { hideText: true });
+      state.stackHits.push({ teammateId: tm.id, x: ox, y: oy, r: ORB_R * orbScale + 6 });
+
+      if (stack.length > 1) {
+        const badgeX = Math.min(ox + ORB_R * orbScale + 2, layout.rightZone.right - 8);
+        const badgeY = Math.max(oy - ORB_R * orbScale - 2, layout.rightZone.top + 10);
+        drawCountBadge(badgeX, badgeY, stack.length, 1.3);
+      }
     }
   }
 
@@ -1234,13 +1239,9 @@ function pickOrbAt(x, y) {
   return null;
 }
 
-function pickRightOrbAt(x, y) {
-  // Iterate in reverse so most-recently-drawn (topmost) hits first
-  for (let i = state.rightOrbHits.length - 1; i >= 0; i--) {
-    const h = state.rightOrbHits[i];
-    if (Math.hypot(h.x - x, h.y - y) <= h.r) {
-      return state.tasks.find(t => t.id === h.taskId) || null;
-    }
+function pickStackOrbAt(x, y) {
+  for (const h of state.stackHits) {
+    if (Math.hypot(h.x - x, h.y - y) <= h.r) return h.teammateId;
   }
   return null;
 }
@@ -1290,10 +1291,10 @@ canvas.addEventListener("pointerdown", (e) => {
     canvas.classList.add("grabbing");
     return;
   }
-  // Right-side orbs on teammate stacks — click opens detail with take-back
-  const rt = pickRightOrbAt(p.x, p.y);
-  if (rt) {
-    state.rightClick = { kind: "orb", taskId: rt.id, startX: p.x, startY: p.y };
+  // Teammate stack-orb — click opens the pile popup (or detail if just 1 task).
+  const tmId = pickStackOrbAt(p.x, p.y);
+  if (tmId) {
+    state.rightClick = { kind: "stack", teammateId: tmId, startX: p.x, startY: p.y };
     canvas.setPointerCapture(e.pointerId);
     return;
   }
@@ -1325,10 +1326,12 @@ canvas.addEventListener("pointermove", (e) => {
   } else {
     // hover cursor + tooltip target
     const orb = pickOrbAt(p.x, p.y);
-    const basketId = orb ? null : pickBasketAt(p.x, p.y);
-    canvas.classList.toggle("over-orb", !!orb || !!basketId);
+    const stackTm = orb ? null : pickStackOrbAt(p.x, p.y);
+    const basketId = (orb || stackTm) ? null : pickBasketAt(p.x, p.y);
+    canvas.classList.toggle("over-orb", !!orb || !!basketId || !!stackTm);
     state.hoverOrbId = orb ? orb.id : null;
     state.hoverBasketId = basketId;
+    state.hoverStackTm = stackTm;
   }
 });
 
@@ -1341,7 +1344,7 @@ canvas.addEventListener("pointerup", (e) => {
     canvas.releasePointerCapture(e.pointerId);
     if (Math.hypot(p.x - click.startX, p.y - click.startY) < DRAG_THRESHOLD) {
       if (click.kind === "basket") openBasket(click.basketId);
-      else openDetail(click.taskId);
+      else if (click.kind === "stack") openTeammateStack(click.teammateId);
     }
     return;
   }
@@ -1564,7 +1567,7 @@ function openDetail(taskId) {
   $("#close-detail").onclick = () => $("#detail-dialog").close();
 }
 
-// === BASKET POPUP ===
+// === LIST POPUP (shared by baskets and teammate stacks) ===
 function timeAgo(ts) {
   const diff = Date.now() - ts;
   const m = Math.floor(diff / 60000);
@@ -1579,10 +1582,7 @@ function timeAgo(ts) {
   return `${Math.floor(mo / 12)}y ago`;
 }
 
-function openBasket(status) {
-  const label = status === "done" ? "DONE" : "BLOCKED";
-  const items = tasksInBasket(status).slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-
+function openListDialog({ title, items, emptyText }) {
   const rows = items.length
     ? items.map(t => {
         const owner = memberById(t.ownerId)?.name || t.ownerId;
@@ -1598,11 +1598,11 @@ function openBasket(status) {
           <div class="basket-when">${escapeHtml(when)}</div>
         </div>`;
       }).join("")
-    : `<div class="basket-empty">Nothing piled in here yet.</div>`;
+    : `<div class="basket-empty">${escapeHtml(emptyText)}</div>`;
 
   $("#basket-content").innerHTML = `
     <div id="basket-toolbar">
-      <h2>${label}</h2>
+      <h2>${escapeHtml(title)}</h2>
       <span class="basket-count">${items.length} ${items.length === 1 ? "QUEST" : "QUESTS"}</span>
       <button id="close-basket">CLOSE</button>
     </div>
@@ -1616,6 +1616,23 @@ function openBasket(status) {
       $("#basket-dialog").close();
       openDetail(id);
     };
+  });
+}
+
+function openBasket(status) {
+  const label = status === "done" ? "DONE" : "BLOCKED";
+  const items = tasksInBasket(status).slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  openListDialog({ title: label, items, emptyText: "Nothing piled in here yet." });
+}
+
+function openTeammateStack(teammateId) {
+  const tm = memberById(teammateId);
+  if (!tm) return;
+  const items = tasksOnTeammate(teammateId).slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  openListDialog({
+    title: `${tm.name.toUpperCase()}'S PILE`,
+    items,
+    emptyText: "Nothing delegated to them yet.",
   });
 }
 
