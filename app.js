@@ -1696,6 +1696,8 @@ const ledgerState = {
   sortDir: "desc",
   filterClient: "all",   // "all" | "Toggle" | "Unitar" | "City U" | "none"
   filterStatus: "all",   // "all" | "active" | "done" | "blocked"
+  filterOwner: "all",    // "all" | <teamMemberId>
+  filterCreator: "all",  // "all" | <teamMemberId>
 };
 
 function openLedger() {
@@ -1710,6 +1712,8 @@ function ledgerFilteredSorted() {
       if ((t.client || "") !== want) return false;
     }
     if (ledgerState.filterStatus !== "all" && t.status !== ledgerState.filterStatus) return false;
+    if (ledgerState.filterOwner !== "all" && t.ownerId !== ledgerState.filterOwner) return false;
+    if (ledgerState.filterCreator !== "all" && t.createdBy !== ledgerState.filterCreator) return false;
     return true;
   });
   const k = ledgerState.sortBy;
@@ -1742,6 +1746,13 @@ function renderLedger() {
     `<option value="${s}" ${ledgerState.filterStatus === s ? "selected" : ""}>${s === "all" ? "All statuses" : s}</option>`
   ).join("");
 
+  const memberOpts = (selected, allLabel) => [
+    `<option value="all" ${selected === "all" ? "selected" : ""}>${escapeHtml(allLabel)}</option>`,
+    ...TEAM.map(m => `<option value="${escapeHtml(m.id)}" ${selected === m.id ? "selected" : ""}>${escapeHtml(m.name)}</option>`),
+  ].join("");
+  const filterOwnerOpts = memberOpts(ledgerState.filterOwner, "All owners");
+  const filterCreatorOpts = memberOpts(ledgerState.filterCreator, "All creators");
+
   const arrow = (key) => ledgerState.sortBy === key
     ? `<span class="sort-arrow">${ledgerState.sortDir === "asc" ? "▲" : "▼"}</span>`
     : "";
@@ -1770,6 +1781,8 @@ function renderLedger() {
       <h2>TASK LEDGER</h2>
       <select id="filter-client">${filterClientOpts}</select>
       <select id="filter-status">${filterStatusOpts}</select>
+      <select id="filter-owner">${filterOwnerOpts}</select>
+      <select id="filter-creator">${filterCreatorOpts}</select>
       <button id="export-csv">⇩ EXPORT CSV</button>
     </div>
     <div id="ledger-table-wrap">
@@ -1782,6 +1795,8 @@ function renderLedger() {
   document.getElementById("close-ledger").onclick = () => $("#ledger-dialog").close();
   document.getElementById("filter-client").onchange = (e) => { ledgerState.filterClient = e.target.value; renderLedger(); };
   document.getElementById("filter-status").onchange = (e) => { ledgerState.filterStatus = e.target.value; renderLedger(); };
+  document.getElementById("filter-owner").onchange = (e) => { ledgerState.filterOwner = e.target.value; renderLedger(); };
+  document.getElementById("filter-creator").onchange = (e) => { ledgerState.filterCreator = e.target.value; renderLedger(); };
   document.getElementById("export-csv").onclick = exportCsv;
 
   document.querySelectorAll("#ledger-table th[data-sort]").forEach(th => {
