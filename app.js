@@ -97,12 +97,45 @@ const state = {
   hoverOrbId: null,               // task id under cursor when not dragging
   hoverBasketId: null,            // basket id under cursor when not dragging (for click affordance)
   hoverStackTm: null,             // teammate id whose stack-orb is hovered (for click affordance)
+  hoverCharTm: null,              // teammate id whose character body is hovered ("me" for self)
   dropAnim: {},                   // taskId -> { start: stateT } for landed-on-target pop
   t: 0,                           // game time, ms
   basketHits: [],                 // { id, x, y, w, h } populated each render for basket click-targeting
   stackHits: [],                  // { teammateId, x, y, r } populated each render for teammate-stack-orb click-targeting
+  charHits: [],                   // { teammateId, x, y, r } populated each render for character click-targeting
+  speechBubbles: {},              // teammateId -> { text, expiresAt } — character lines on click
   rightClick: null,               // { kind, basketId?, teammateId?, startX, startY } pending click on a right-side target
 };
+
+// Per-character lines, keyed by normalised name (lowercase, dots/spaces stripped).
+// Look up against `memberById(tmId).name` so the mapping survives roster id changes.
+const CHARACTER_LINES = {
+  vik:    "How much we charging G?",
+  jp:     "start start START",
+  aizad:  "Can Mike",
+  yy:     "Thinking",
+  lau:    "Ah okay no probs",
+  laa:    "Ah okay no probs",
+  sb:     "Wassup good sir",
+  julian: "Fking punde",
+  zaid:   "Hello hello",
+};
+const CHARACTER_LINE_DEFAULT = "...";
+
+function normalizeName(s) {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+function lineForTeammate(tmId) {
+  const m = memberById(tmId);
+  if (!m) return CHARACTER_LINE_DEFAULT;
+  return CHARACTER_LINES[normalizeName(m.name)] || CHARACTER_LINE_DEFAULT;
+}
+
+function sayCharacterLine(tmId) {
+  const text = lineForTeammate(tmId);
+  // 3.5s total — last 500ms is the fade applied at draw time.
+  state.speechBubbles[tmId] = { text, expiresAt: Date.now() + 3500 };
+}
 
 function loadTasks() {
   try {
@@ -928,6 +961,67 @@ function drawCountBadge(cx, cy, n, scale = 1) {
   ctx.fillText(String(n), cx, cy + 1);
 }
 
+// Pixel speech bubble — cream fill + dark border + tail pointing down at the
+// character. cx/anchorY = where the tail tip should land (roughly above the
+// character's head label). alpha lets the bubble fade out.
+function drawSpeechBubble(cx, anchorY, text, alpha = 1) {
+  if (!text) return;
+  const lines = wrapText(text, 18).slice(0, 3);
+  ctx.font = '8px "Press Start 2P", monospace';
+  const lineH = 12;
+  const padX = 8;
+  const padY = 7;
+  const textW = Math.max(...lines.map(l => ctx.measureText(l).width));
+  const w = Math.max(60, textW + padX * 2);
+  const h = padY * 2 + lineH * lines.length;
+  const tailH = 6;
+  const x = Math.round(cx - w / 2);
+  const y = Math.round(anchorY - tailH - h);
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  // Drop shadow
+  ctx.fillStyle = "rgba(0,0,0,0.4)";
+  ctx.fillRect(x + 2, y + 2, w, h);
+
+  // Body — cream fill, dark border, pixel-bevel
+  ctx.fillStyle = "#0d0a1a";
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = "#ede0c0";
+  ctx.fillRect(x + 2, y + 2, w - 4, h - 4);
+  // Inner highlight strip
+  ctx.fillStyle = "#fff4d6";
+  ctx.fillRect(x + 2, y + 2, w - 4, 2);
+
+  // Tail — small triangle pointing down to anchor
+  ctx.fillStyle = "#0d0a1a";
+  ctx.beginPath();
+  ctx.moveTo(cx - 5, y + h);
+  ctx.lineTo(cx + 5, y + h);
+  ctx.lineTo(cx,     y + h + tailH);
+  ctx.closePath();
+  ctx.fill();
+  // Tail interior (cream, 1px inset)
+  ctx.fillStyle = "#ede0c0";
+  ctx.beginPath();
+  ctx.moveTo(cx - 3, y + h - 1);
+  ctx.lineTo(cx + 3, y + h - 1);
+  ctx.lineTo(cx,     y + h + tailH - 2);
+  ctx.closePath();
+  ctx.fill();
+
+  // Text
+  ctx.fillStyle = "#0d0a1a";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  lines.forEach((line, i) => {
+    ctx.fillText(line, cx, y + padY + lineH * i + lineH / 2);
+  });
+
+  ctx.restore();
+}
+
 // === ORBS ===
 function wrapText(text, maxLen) {
   const words = text.split(/\s+/);
@@ -1076,6 +1170,7 @@ function render() {
   // Reset per-frame hit registries for right-side click targeting.
   state.basketHits.length = 0;
   state.stackHits.length = 0;
+  state.charHits.length = 0;
 
   // Static background (floor + wall body) from cache; animated torches on top.
   if (bgCache) {
@@ -1090,6 +1185,8 @@ function render() {
   drawCharacter(layout.me.x, layout.me.y, layout.me.color, bob);
   drawNameLabel(layout.me.x, layout.me.y - CHAR_H / 2 - 14, layout.me.name, meStreak);
   drawTitleLabel(layout.me.x, layout.me.y + CHAR_H / 2 + 12, meStreak);
+  // Register my own character body as a click target for speech bubbles
+  state.charHits.push({ teammateId: layout.me.id, x: layout.me.x, y: layout.me.y, r: CHAR_W * 0.55 });
 
   // Floating tasks on left
   for (const t of tasksOnMyLeft()) {
@@ -1108,6 +1205,8 @@ function render() {
     // Skip title in dense grids — there's no room and it visually merges with
     // the next row's character. Title still shows in the Tavern.
     if (!tmDense) drawTitleLabel(tm.x, tm.y + CHAR_H / 2 + 12, tmStreak);
+    // Register the teammate's body as a click target for speech bubbles
+    state.charHits.push({ teammateId: tm.id, x: tm.x, y: tm.y, r: CHAR_W * 0.55 });
 
     // Hover highlight ring
     if (state.hoverTarget && state.hoverTarget.kind === "person" && state.hoverTarget.id === tm.id) {
@@ -1190,6 +1289,20 @@ function render() {
       drawHoverTooltip(t);
     }
   }
+
+  // Active speech bubbles — drawn last so they sit on top of everything else.
+  // Expired entries get cleaned up here.
+  const now = Date.now();
+  for (const id of Object.keys(state.speechBubbles)) {
+    const b = state.speechBubbles[id];
+    if (now >= b.expiresAt) { delete state.speechBubbles[id]; continue; }
+    const hit = state.charHits.find(h => h.teammateId === id);
+    if (!hit) continue;
+    const remaining = b.expiresAt - now;
+    const fade = remaining < 500 ? remaining / 500 : 1;
+    const anchorY = hit.y - CHAR_H / 2 - 22;  // just above the name label
+    drawSpeechBubble(hit.x, anchorY, b.text, fade);
+  }
 }
 
 function drawHoverTooltip(t) {
@@ -1241,6 +1354,13 @@ function pickOrbAt(x, y) {
 
 function pickStackOrbAt(x, y) {
   for (const h of state.stackHits) {
+    if (Math.hypot(h.x - x, h.y - y) <= h.r) return h.teammateId;
+  }
+  return null;
+}
+
+function pickCharacterAt(x, y) {
+  for (const h of state.charHits) {
     if (Math.hypot(h.x - x, h.y - y) <= h.r) return h.teammateId;
   }
   return null;
@@ -1303,6 +1423,13 @@ canvas.addEventListener("pointerdown", (e) => {
   if (bId) {
     state.rightClick = { kind: "basket", basketId: bId, startX: p.x, startY: p.y };
     canvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  // Character body — click triggers their signature speech bubble.
+  const charTm = pickCharacterAt(p.x, p.y);
+  if (charTm) {
+    state.rightClick = { kind: "char", teammateId: charTm, startX: p.x, startY: p.y };
+    canvas.setPointerCapture(e.pointerId);
   }
 });
 
@@ -1328,10 +1455,12 @@ canvas.addEventListener("pointermove", (e) => {
     const orb = pickOrbAt(p.x, p.y);
     const stackTm = orb ? null : pickStackOrbAt(p.x, p.y);
     const basketId = (orb || stackTm) ? null : pickBasketAt(p.x, p.y);
-    canvas.classList.toggle("over-orb", !!orb || !!basketId || !!stackTm);
+    const charTm = (orb || stackTm || basketId) ? null : pickCharacterAt(p.x, p.y);
+    canvas.classList.toggle("over-orb", !!orb || !!basketId || !!stackTm || !!charTm);
     state.hoverOrbId = orb ? orb.id : null;
     state.hoverBasketId = basketId;
     state.hoverStackTm = stackTm;
+    state.hoverCharTm = charTm;
   }
 });
 
@@ -1345,6 +1474,7 @@ canvas.addEventListener("pointerup", (e) => {
     if (Math.hypot(p.x - click.startX, p.y - click.startY) < DRAG_THRESHOLD) {
       if (click.kind === "basket") openBasket(click.basketId);
       else if (click.kind === "stack") openTeammateStack(click.teammateId);
+      else if (click.kind === "char") sayCharacterLine(click.teammateId);
     }
     return;
   }
