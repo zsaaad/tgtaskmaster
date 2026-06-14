@@ -7,11 +7,11 @@
 // first-ever boot (no remote, no local cache); after that, snapshot listener
 // + localStorage cache are the source of truth.
 const TEAM_SEED = [
-  { id: "zaid", name: "Zaid", color: "#5b8def" },
-  { id: "yy",   name: "YY",   color: "#e8743b" },
-  { id: "vik",  name: "Vik",  color: "#3aa17a" },
-  { id: "lina", name: "Lina", color: "#9c6bd8" },
-  { id: "sam",  name: "Sam",  color: "#1bb0c2" },
+  { id: "zaid", name: "Zaid", color: "#5b8def", email: "zaidsaad1994@gmail.com" },
+  { id: "yy",   name: "YY",   color: "#e8743b", email: "yiyang@toggle.solutions" },
+  { id: "vik",  name: "Vik",  color: "#3aa17a", email: "vikneshsivanandan@gmail.com" },
+  { id: "lina", name: "Lina", color: "#9c6bd8", email: "" },
+  { id: "sam",  name: "Sam",  color: "#1bb0c2", email: "" },
 ];
 let TEAM = loadTeamCached();
 
@@ -32,11 +32,11 @@ function loadTeamCached() {
     if (Array.isArray(raw) && raw.length > 0) return raw;
   } catch {}
   return [
-    { id: "zaid", name: "Zaid", color: "#5b8def" },
-    { id: "yy",   name: "YY",   color: "#e8743b" },
-    { id: "vik",  name: "Vik",  color: "#3aa17a" },
-    { id: "lina", name: "Lina", color: "#9c6bd8" },
-    { id: "sam",  name: "Sam",  color: "#1bb0c2" },
+    { id: "zaid", name: "Zaid", color: "#5b8def", email: "zaidsaad1994@gmail.com" },
+    { id: "yy",   name: "YY",   color: "#e8743b", email: "yiyang@toggle.solutions" },
+    { id: "vik",  name: "Vik",  color: "#3aa17a", email: "vikneshsivanandan@gmail.com" },
+    { id: "lina", name: "Lina", color: "#9c6bd8", email: "" },
+    { id: "sam",  name: "Sam",  color: "#1bb0c2", email: "" },
   ];
 }
 function saveTeamCached() { localStorage.setItem(STORAGE_TEAM, JSON.stringify(TEAM)); }
@@ -1113,21 +1113,46 @@ function clampToZone(t) {
 function step(dt) {
   const b = layout.leftZone;
   if (!b) return;
-  for (const t of state.tasks) {
-    if (t.status !== "active") continue;
-    if (t.ownerId !== state.me) continue;
-    if (state.drag && state.drag.taskId === t.id) continue;
 
-    // Newly-arrived tasks (e.g. taken back from a basket) need a spawn position
+  const mine = state.tasks.filter(t =>
+    t.status === "active" &&
+    t.ownerId === state.me &&
+    !(state.drag && state.drag.taskId === t.id));
+
+  // Newly-arrived tasks (e.g. taken back from a basket) need a spawn position
+  for (const t of mine) {
     if (t.x == null || t.y == null) assignSpawn(t);
+  }
 
-    // Gentle wander force + slight pull toward center — quiet enough to read as floating dust
+  // Pairwise separation — without this, the gentle center-pull below collapses
+  // every orb into one overlapping blob. Push any two orbs that get closer than
+  // a comfortable gap apart, so they settle into a readable cloud.
+  const minGap = ORB_R * 2 + 10;
+  for (let i = 0; i < mine.length; i++) {
+    for (let j = i + 1; j < mine.length; j++) {
+      const a = mine[i], c = mine[j];
+      let dx = c.x - a.x, dy = c.y - a.y;
+      let dist = Math.hypot(dx, dy);
+      if (dist < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; dist = Math.hypot(dx, dy) || 1; }
+      if (dist < minGap) {
+        const push = ((minGap - dist) / minGap) * 0.12;
+        const ux = dx / dist, uy = dy / dist;
+        a.vx -= ux * push; a.vy -= uy * push;
+        c.vx += ux * push; c.vy += uy * push;
+      }
+    }
+  }
+
+  const ccx = (b.left + b.right) / 2;
+  const ccy = (b.top + b.bottom) / 2;
+  for (const t of mine) {
+    // Gentle wander force + a faint pull toward center — quiet enough to read as
+    // floating dust. The pull keeps orbs from creeping to the walls; the
+    // separation pass above keeps them from piling up at the center.
     t.vx = (t.vx || 0) + (Math.random() - 0.5) * 0.025;
     t.vy = (t.vy || 0) + (Math.random() - 0.5) * 0.025;
-    const ccx = (b.left + b.right) / 2;
-    const ccy = (b.top + b.bottom) / 2;
-    t.vx += (ccx - t.x) * 0.00004;
-    t.vy += (ccy - t.y) * 0.00004;
+    t.vx += (ccx - t.x) * 0.00002;
+    t.vy += (ccy - t.y) * 0.00002;
 
     // Damping — high enough that motion settles to a slow drift
     t.vx *= 0.992;
@@ -2090,6 +2115,7 @@ function renderSettings() {
         <div class="settings-row" data-member-id="${escapeHtml(m.id)}">
           <span class="swatch" style="background:${escapeHtml(m.color)}"></span>
           <input class="member-name" type="text" maxlength="20" value="${escapeHtml(m.name)}" />
+          <input class="member-email" type="email" maxlength="80" placeholder="email for calendar invites" value="${escapeHtml(m.email || "")}" />
           <input class="member-color" type="color" value="${escapeHtml(m.color)}" title="character color" />
           <span class="member-meta">${counts.owned} task${counts.owned === 1 ? "" : "s"}${isMe ? " · you" : ""}</span>
           <button class="row-delete" ${canDelete ? "" : "disabled"} title="${escapeHtml(tooltip)}">✕</button>
@@ -2101,6 +2127,7 @@ function renderSettings() {
         <div class="settings-row add-form" id="add-member-form">
           <span class="swatch" style="background:${escapeHtml(settingsState.newMember.color)}"></span>
           <input id="new-member-name" type="text" maxlength="20" placeholder="name" value="${escapeHtml(settingsState.newMember.name)}" autofocus />
+          <input id="new-member-email" type="email" maxlength="80" placeholder="email (optional)" value="${escapeHtml(settingsState.newMember.email || "")}" />
           <input id="new-member-color" type="color" value="${escapeHtml(settingsState.newMember.color)}" title="character color" />
           <button id="new-member-save">add</button>
           <button id="new-member-cancel">cancel</button>
@@ -2112,7 +2139,7 @@ function renderSettings() {
         ${rows}
         ${addForm}
       </div>
-      <p class="settings-hint">edit a name or color and click outside the field to save · ✕ removes a member (only if they have no active tasks)</p>
+      <p class="settings-hint">edit a field and click outside to save · email = personal calendar that gets the invites · ✕ removes a member (only if they have no active tasks)</p>
     `;
   } else {
     const rows = CLIENTS.map(c => {
@@ -2159,22 +2186,26 @@ function wireRosterHandlers() {
   document.querySelectorAll(".settings-row[data-member-id]").forEach(row => {
     const id = row.dataset.memberId;
     const nameInput = row.querySelector(".member-name");
+    const emailInput = row.querySelector(".member-email");
     const colorInput = row.querySelector(".member-color");
     const delBtn = row.querySelector(".row-delete");
 
     const commit = () => {
       const newName = nameInput.value.trim();
+      const newEmail = emailInput.value.trim();
       const newColor = colorInput.value;
       const current = TEAM.find(m => m.id === id);
       if (!current) return;
-      if (newName === current.name && newColor === current.color) return;
+      if (newName === current.name && newEmail === (current.email || "") && newColor === current.color) return;
       if (!newName) { nameInput.value = current.name; return; }
-      const next = TEAM.map(m => m.id === id ? { ...m, name: newName, color: newColor } : m);
+      const next = TEAM.map(m => m.id === id ? { ...m, name: newName, email: newEmail, color: newColor } : m);
       persist.rosterUpdate(next);
     };
     nameInput.onchange = commit;
+    emailInput.onchange = commit;
     colorInput.onchange = commit;
     nameInput.onkeydown = (e) => { if (e.key === "Enter") nameInput.blur(); };
+    emailInput.onkeydown = (e) => { if (e.key === "Enter") emailInput.blur(); };
 
     if (!delBtn.disabled) {
       delBtn.onclick = () => {
@@ -2190,25 +2221,29 @@ function wireRosterHandlers() {
   const addBtn = $("#add-member-btn");
   if (addBtn) {
     addBtn.onclick = () => {
-      settingsState.newMember = { name: "", color: randomMemberColor() };
+      settingsState.newMember = { name: "", email: "", color: randomMemberColor() };
       renderSettings();
     };
   }
   if (settingsState.newMember) {
     const nameEl = $("#new-member-name");
+    const emailEl = $("#new-member-email");
     const colorEl = $("#new-member-color");
     const saveEl = $("#new-member-save");
     const cancelEl = $("#new-member-cancel");
     nameEl.oninput = () => { settingsState.newMember.name = nameEl.value; };
+    emailEl.oninput = () => { settingsState.newMember.email = emailEl.value; };
     colorEl.oninput = () => { settingsState.newMember.color = colorEl.value; };
     nameEl.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); saveEl.click(); } if (e.key === "Escape") cancelEl.click(); };
+    emailEl.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); saveEl.click(); } if (e.key === "Escape") cancelEl.click(); };
     cancelEl.onclick = () => { settingsState.newMember = null; renderSettings(); };
     saveEl.onclick = () => {
       const name = (settingsState.newMember.name || "").trim();
+      const email = (settingsState.newMember.email || "").trim();
       const color = settingsState.newMember.color || randomMemberColor();
       if (!name) { nameEl.focus(); return; }
       const id = makeMemberId(name);
-      const next = [...TEAM, { id, name, color }];
+      const next = [...TEAM, { id, name, email, color }];
       settingsState.newMember = null;
       persist.rosterUpdate(next);
     };

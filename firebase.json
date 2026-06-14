@@ -13,7 +13,8 @@
       "public/**",
       "node_modules/**",
       "*.md",
-      "*.log"
+      "*.log",
+      "*.gs"
     ],
     "headers": [
       {

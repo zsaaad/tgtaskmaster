@@ -102,6 +102,44 @@ open index.html
 Pre-code. Design locked, [`CLAUDE.md`](./CLAUDE.md) holds the build plan and
 data model. Phase 1 prototype is the next thing to build.
 
+## Google Calendar sync
+
+Tasks with a due date are mirrored to the **Toggle Task Manager** calendar in
+`hello@toggle.solutions` so the team can see what's due where they already
+keep their calendar.
+
+- One-way: app → calendar. The calendar is read-only by intention; do not
+  edit events by hand.
+- Polls every 5 minutes via a Google Apps Script bound to
+  `hello@toggle.solutions`. No backend, no Cloud Functions.
+- Tasks without a due date are not on the calendar.
+- `blocked` tasks show in red; `done` tasks show in graphite. Reassigning a
+  task updates the existing event (no duplicate).
+
+### First-time setup
+
+1. Open <https://script.google.com> while signed in as `hello@toggle.solutions`.
+2. **New project** → name it `Toggle Task Master — calendar sync`.
+3. **Services** (sidebar +) → add **Google Calendar API** (identifier
+   `Calendar`, default version).
+4. Replace the contents of `Code.gs` with [`gcal-sync.gs`](./gcal-sync.gs) from
+   this repo.
+5. Edit `CONFIG.API_KEY` to the Firebase web `apiKey` (same value used in
+   `firebase-config.js`).
+6. Save → **Run** the `syncTasksToCalendar` function once manually. Approve
+   the OAuth scopes when prompted (Calendar + external requests).
+7. Verify in the Toggle Task Manager calendar: events with due dates should
+   appear within seconds.
+8. **Triggers** (clock icon) → **Add Trigger**: function
+   `syncTasksToCalendar`, event source `Time-driven`, type `Minutes timer`,
+   every **5 minutes**.
+
+### Updating the script
+
+Edit `gcal-sync.gs` here, copy the contents into the bound Apps Script
+project, save. There is no automated deploy — by design, to keep the repo
+backend-free.
+
 ## What this is NOT
 
 - Not a project management tool. No projects, no milestones, no Gantt.
